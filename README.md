@@ -52,6 +52,13 @@ sync --doctor
 
 Python が無い場合は [python.org](https://www.python.org/downloads/) からインストールし、`Add python.exe to PATH` を有効にしてください。
 
+自動 commit を使う場合、Git の作者名が必要です。未設定なら一度だけ:
+
+```powershell
+git config --global user.name "Your Name"
+git config --global user.email "you@example.com"
+```
+
 ## sync の使い方
 
 ### 初回

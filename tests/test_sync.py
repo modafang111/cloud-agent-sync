@@ -222,6 +222,12 @@ class HelperTests(unittest.TestCase):
             "auto sync 2026-08-28 21:07:09",
         )
 
+    def test_identity_error_detection(self) -> None:
+        from sync import looks_like_identity_error
+
+        self.assertTrue(looks_like_identity_error("Author identity unknown\nPlease tell me who you are."))
+        self.assertFalse(looks_like_identity_error("could not resolve host github.com"))
+
     def test_discover_does_not_enter_nested_git(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

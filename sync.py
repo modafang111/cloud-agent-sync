@@ -187,6 +187,7 @@ class RepoResult:
     conflict_files: list[str] = field(default_factory=list)
     git_state: str = ""
     network_error: bool = False
+    identity_error: bool = False
     actions: list[str] = field(default_factory=list)
 
 
@@ -226,6 +227,47 @@ def configure_stdio() -> None:
 
 def eprint(*args: Any) -> None:
     print(*args, file=sys.stderr)
+
+
+IDENTITY_MISSING_MESSAGE = "Git の user.name / user.email が未設定のため commit できません"
+IDENTITY_HINT_LINES = (
+    "未コミットの変更を自動 commit するには、一度だけ Git の作者名を設定してください。",
+    "  git config --global user.name \"Your Name\"",
+    "  git config --global user.email \"you@example.com\"",
+    "既存リポジトリの remote / branch は変更しません。設定後にもう一度 sync を実行してください。",
+)
+
+
+def looks_like_identity_error(text: str) -> bool:
+    lower = text.lower()
+    return "author identity unknown" in lower or "please tell me who you are" in lower
+
+
+def git_config_get(key: str, repo: Path | None = None) -> str:
+    command = ["git"]
+    if repo is not None:
+        command.extend(["-C", str(repo)])
+    command.extend(["config", "--get", key])
+    completed = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        return ""
+    return completed.stdout.strip()
+
+
+def read_git_identity(repo: Path | None = None) -> tuple[str, str]:
+    return git_config_get("user.name", repo), git_config_get("user.email", repo)
+
+
+def has_git_identity(repo: Path | None = None) -> bool:
+    name, email = read_git_identity(repo)
+    return bool(name and email)
 
 
 def looks_like_network_error(text: str) -> bool:
@@ -770,6 +812,11 @@ def sync_one(
                 result.message = "未コミットの変更があります（auto_commit=false）"
                 result.kind = ResultKind.ERROR
                 return result
+            if not has_git_identity(path):
+                result.kind = ResultKind.ERROR
+                result.identity_error = True
+                result.message = IDENTITY_MISSING_MESSAGE
+                return result
             message = format_commit_message(app.commit_message_format)
             committed = commit_if_needed(git, message)
             if committed:
@@ -808,6 +855,11 @@ def sync_one(
             result.network_error = True
             result.message = "GitHub接続エラー"
             result.details.append(str(exc))
+            return result
+        if looks_like_identity_error(text):
+            result.kind = ResultKind.ERROR
+            result.identity_error = True
+            result.message = IDENTITY_MISSING_MESSAGE
             return result
         lower = text.lower()
         if "non-fast-forward" in lower or "failed to push some refs" in lower or "rejected" in lower:
@@ -852,6 +904,10 @@ def print_summary(results: Sequence[RepoResult]) -> None:
     print(f"コンフリクト：{conflict}件")
     print(f"接続エラー：{network}件")
     print(f"その他エラー：{other}件")
+    if any(r.identity_error for r in results):
+        print()
+        for line in IDENTITY_HINT_LINES:
+            print(line)
 
 
 def stdin_is_tty() -> bool:
@@ -1009,11 +1065,15 @@ def cmd_doctor(app: AppConfig, repos_path: Path) -> int:
             errors="replace",
             check=False,
         )
-        if user.stdout.strip():
-            print(f"  git user.name: {user.stdout.strip()}")
-        if email.stdout.strip():
-            print(f"  git user.email: {email.stdout.strip()}")
+        name = user.stdout.strip() or "(未設定)"
+        mail = email.stdout.strip() or "(未設定)"
+        print(f"  git user.name: {name}")
+        print(f"  git user.email: {mail}")
         print("  GitHub 認証: 既存の Git Credential Manager / SSH 設定をそのまま利用します")
+        if name == "(未設定)" or mail == "(未設定)":
+            print("  [警告] 自動 commit するには user.name と user.email が必要です。")
+            print('         git config --global user.name "Your Name"')
+            print('         git config --global user.email "you@example.com"')
 
     if is_windows():
         user_path = os.environ.get("PATH", "")
