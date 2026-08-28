@@ -12,6 +12,9 @@
   "provision_non_git": true,
   "ensure_gitignore": true,
   "gitignore_template": "gitignore.template",
+  "auto_add_projects": true,
+  "auto_provision_github": true,
+  "auto_init_non_git": true,
   "exclude_dir_names": [
     ".git",
     "node_modules",

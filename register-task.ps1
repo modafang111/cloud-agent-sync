@@ -37,5 +37,6 @@ Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Se
 Write-Host ('Registered scheduled task: ' + $TaskName)
 Write-Host ('Command: ' + $Cmd)
 Write-Host ('Daily at: ' + $Time)
-Write-Host 'This task only runs sync. It does not call AI, --provision, or --init.'
+Write-Host 'This task only runs sync. It does not call AI or --init.'
+Write-Host 'New source folders under D:\dev are auto-added; --disable stays disabled.'
 Write-Host 'GitHub auth works best while you are logged on to Windows.'

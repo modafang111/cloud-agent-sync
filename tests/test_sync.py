@@ -518,18 +518,144 @@ class ProvisionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             (root / "plain").mkdir()
+            (root / "plain" / "app.py").write_text("print(1)\n", encoding="utf-8")
             init_repo(root / "already-git")
             (root / "node_modules").mkdir()
             (root / "logs").mkdir()
             venv_dir = root / "app.venv"
             venv_dir.mkdir()
             (venv_dir / "pyvenv.cfg").write_text("home = .\n", encoding="utf-8")
+            tools = root / "tools"
+            tools.mkdir()
+            (tools / "ffmpeg").mkdir()
+            (tools / "ffmpeg" / "ffmpeg.exe").write_text("bin\n", encoding="utf-8")
+            empty = root / "empty"
+            empty.mkdir()
             found = {p.name for p in syncmod.discover_non_git_projects(root, {"node_modules", ".git", "logs"})}
             self.assertIn("plain", found)
             self.assertNotIn("already-git", found)
             self.assertNotIn("node_modules", found)
             self.assertNotIn("logs", found)
             self.assertNotIn("app.venv", found)
+            self.assertNotIn("tools", found)
+            self.assertNotIn("empty", found)
+
+
+class AutoAddTests(unittest.TestCase):
+    def test_source_vs_tool_dump(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            src = root / "app"
+            src.mkdir()
+            (src / "main.py").write_text("print(1)\n", encoding="utf-8")
+            self.assertTrue(syncmod.looks_like_source_project(src))
+            tools = root / "tools"
+            (tools / "ffmpeg").mkdir(parents=True)
+            (tools / "ffmpeg" / "ffmpeg.exe").write_bytes(b"MZ")
+            self.assertTrue(syncmod.looks_like_tool_dump(tools))
+            self.assertFalse(syncmod.looks_like_source_project(tools))
+            empty = root / "empty"
+            empty.mkdir()
+            self.assertFalse(syncmod.looks_like_source_project(empty))
+            ngrok = root / "ngrok"
+            ngrok.mkdir()
+            (ngrok / "ngrok.exe").write_bytes(b"MZ")
+            self.assertTrue(syncmod.looks_like_tool_dump(ngrok))
+            self.assertFalse(syncmod.looks_like_source_project(ngrok))
+
+    def test_auto_enroll_adds_source_skips_disabled_and_junk(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            root = tmp / "dev"
+            root.mkdir()
+
+            known_remote = init_repo(tmp / "known.git", bare=True)
+            known = init_repo(root / "known")
+            write_commit(known, "a.py", "print(1)\n", "known")
+            git(known, "remote", "add", "origin", str(known_remote))
+            git(known, "push", "origin", "HEAD:refs/heads/main")
+
+            new_remote = init_repo(tmp / "new.git", bare=True)
+            new_app = init_repo(root / "new-app")
+            write_commit(new_app, "app.py", "print(2)\n", "new")
+            git(new_app, "remote", "add", "origin", str(new_remote))
+            git(new_app, "push", "origin", "HEAD:refs/heads/main")
+
+            disabled_remote = init_repo(tmp / "old.git", bare=True)
+            disabled = init_repo(root / "old-app")
+            write_commit(disabled, "x.py", "print(3)\n", "old")
+            git(disabled, "remote", "add", "origin", str(disabled_remote))
+            git(disabled, "push", "origin", "HEAD:refs/heads/main")
+
+            tools = init_repo(root / "tools")
+            (tools / "ffmpeg").mkdir()
+            (tools / "ffmpeg" / "ffmpeg.exe").write_bytes(b"MZ")
+            git(tools, "add", "-A")
+            git(tools, "-c", "commit.gpgsign=false", "commit", "-m", "ffmpeg")
+
+            plain = root / "plain-app"
+            plain.mkdir()
+            (plain / "main.py").write_text("print(4)\n", encoding="utf-8")
+
+            venv_dir = root / "app.venv"
+            venv_dir.mkdir()
+            (venv_dir / "pyvenv.cfg").write_text("home = .\n", encoding="utf-8")
+
+            no_remote = init_repo(root / "orphan-src")
+            write_commit(no_remote, "svc.py", "print(5)\n", "orphan")
+
+            app = make_app(tmp, root)
+            repos_path = tmp / "repositories.json"
+            syncmod.save_repositories(
+                repos_path,
+                [
+                    RepoConfig("known", str(known), True),
+                    RepoConfig("old-app", str(disabled), False),
+                ],
+            )
+            logger = make_logger(tmp)
+            self.addCleanup(logger.close)
+            api = FakeGithubApi(tmp / "gh")
+            results = syncmod.auto_enroll_new_projects(app, repos_path, logger, api=api)
+            kinds = {item.name: item.kind for item in results}
+            self.assertEqual(kinds.get("new-app"), ResultKind.ADD, kinds)
+            self.assertEqual(kinds.get("plain-app"), ResultKind.CREATE, kinds)
+            self.assertEqual(kinds.get("orphan-src"), ResultKind.CREATE, kinds)
+            self.assertNotIn("old-app", kinds)
+            self.assertNotIn("tools", kinds)
+            self.assertNotIn("known", kinds)
+            self.assertNotIn("app.venv", kinds)
+            self.assertIn("plain-app", api.created)
+            self.assertIn("orphan-src", api.created)
+
+            loaded = {repo.name: repo for repo in syncmod.load_repositories(repos_path)}
+            self.assertTrue(loaded["new-app"].enabled)
+            self.assertFalse(loaded["old-app"].enabled)
+            self.assertTrue(loaded["plain-app"].enabled)
+            self.assertTrue(loaded["orphan-src"].enabled)
+            self.assertNotIn("tools", loaded)
+            remotes = git(no_remote, "remote", "-v").stdout
+            self.assertIn("origin", remotes)
+
+    def test_auto_add_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            root = tmp / "dev"
+            root.mkdir()
+            remote = init_repo(tmp / "new.git", bare=True)
+            new_app = init_repo(root / "new-app")
+            write_commit(new_app, "app.py", "print(1)\n", "new")
+            git(new_app, "remote", "add", "origin", str(remote))
+            git(new_app, "push", "origin", "HEAD:refs/heads/main")
+            app = make_app(tmp, root)
+            app.auto_add_projects = False
+            repos_path = tmp / "repositories.json"
+            syncmod.save_repositories(repos_path, [])
+            logger = make_logger(tmp)
+            self.addCleanup(logger.close)
+            results = syncmod.auto_enroll_new_projects(app, repos_path, logger, api=FakeGithubApi(tmp / "gh"))
+            self.assertEqual(results, [])
+            self.assertEqual(syncmod.load_repositories(repos_path), [])
 
 
 if __name__ == "__main__":

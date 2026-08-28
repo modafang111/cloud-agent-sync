@@ -17,7 +17,7 @@ D:\dev 配下の複数プロジェクト  →  cloud-agent-sync（このツー�
 - 既存プロジェクトの `.git` / `remote` / `branch` は、remote が無いプロジェクトを `sync --provision` で新規接続する場合を除き変更しません。
 - `git push --force` / `git reset --hard` / `git clean -fd` / 履歴の強制書き換えは行いません。
 
-日常操作は **`sync` だけ** です。常駐監視・定期実行・起動時自動同期はありません。
+日常操作は **`sync` だけ** です。任意で Windows タスクに毎日の `sync` を登録できます。常駐監視はありません。
 
 ## インストール方法
 
@@ -78,7 +78,8 @@ sync
 例: q   （何も選ばない）
 ```
 
-選んだ内容は `repositories.json` に保存されます。以後はここに載っている **enabled=true** のプロジェクトだけを同期します。
+選んだ内容は `repositories.json` に保存されます。以後はここに載っている **enabled=true** のプロジェクトを同期します。  
+`D:\dev` に後から増えたソースプロジェクトは、日常の `sync`（毎日のタスク含む）で自動的に対象へ入ります。`--disable` したものは再有効化しません。
 
 ### 2 回目以降
 
@@ -86,7 +87,15 @@ sync
 sync
 ```
 
-各プロジェクトについて、次をこの順で行います。
+`D:\dev` に新しいソースプロジェクトが増えていれば、先に同期対象へ追加します。
+
+- Git があり remote もある → 有効な対象として追加（`[ADD]`）
+- Git はあるが remote が無い → プライベート GitHub リポジトリを作って `origin` を付け、対象に追加（`[CREATE]`）
+- Git が無いソースフォルダ → `git init` のうえ同様に GitHub 作成
+- venv / logs / `ffmpeg` だけの置き場 / exe だけのフォルダは無視
+- `sync --disable` したものは触らない
+
+そのあと、有効な各プロジェクトについて次をこの順で行います。
 
 1. Git リポジトリとして正常か確認
 2. remote を確認
@@ -118,7 +127,8 @@ auto sync YYYY-MM-DD HH:MM:SS
 | `[OK]` | 同期完了 |
 | `[PULL]` | リモート変更を fast-forward で取得 |
 | `[PUSH]` | ローカル変更を commit / push |
-| `[SKIP]` | 変更なし |
+| `[ADD]` | `D:\dev` の新規プロジェクトを同期対象に追加 |
+| `[CREATE]` | GitHub リポジトリを新規作成して対象に追加 |
 | `[CONFLICT]` | 競合、または双方に進んだ変更があり停止 |
 | `[ERROR]` | 接続エラーなど |
 
@@ -153,6 +163,8 @@ auto sync YYYY-MM-DD HH:MM:SS
 
 ## 同期対象プロジェクトの追加方法
 
+新しいソースフォルダを `D:\dev` に置くだけで、次の `sync` が自動で対象に入れます。手動でも追加できます。
+
 初回の選択をやり直す:
 
 ```powershell
@@ -183,8 +195,8 @@ sync --enable project-d
 
 ## GitHub リポジトリが無いプロジェクト
 
-日常の `sync` は、**すでに Git があり、すでに remote があるプロジェクト** だけを同期します。  
-GitHub リポジトリが無いもの、Git 自体が無いフォルダは、次のコマンドで作成して対象に入れます。
+日常の `sync` は、ソースらしい新規フォルダなら GitHub リポジトリも自動作成します。  
+確認しながら作りたいときだけ:
 
 ```powershell
 sync --provision
@@ -281,12 +293,20 @@ sync --doctor    # Git / Python / D:\dev / PATH を点検
 
 | ファイル | 用途 |
 |---|---|
-| `config.json` | 同期ルート（既定 `D:\dev`）、深さ、自動 commit、gitignore など |
+| `config.json` | 同期ルート（既定 `D:\dev`）、深さ、自動 commit、gitignore、新規プロジェクト自動追加など |
 | `gitignore.template` | 各プロジェクトへ入れる「ソース以外を除外」のひな形 |
 | `repositories.json` | 同期対象。初回 `sync` で生成。Git 管理しない（マシン固有） |
 | `repositories.example.json` | 見本 |
 
 `ensure_gitignore` が true のとき、`sync` と `sync --provision` は各プロジェクトの `.gitignore` に管理用ブロックを足します。既存の独自ルールは残します。ログ、venv、`ffmpeg/`、`.env` などは GitHub に送りません。すでに commit 済みの大きなファイルは履歴から自動削除しません。
+
+新規プロジェクトの自動追加を止める場合は `config.json` で次を `false` にします。
+
+| キー | 意味 |
+|---|---|
+| `auto_add_projects` | `D:\dev` の未登録フォルダを `sync` で取り込む |
+| `auto_provision_github` | remote が無い／Git 未初期化のソースフォルダを GitHub に作成する |
+| `auto_init_non_git` | Git が無いソースフォルダを `git init` してから作成する |
 
 ## Windows タスク登録
 
@@ -314,8 +334,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1 -Unregis
 
 注意:
 
-- 事前に `sync --init` 済みであること（対話入力はタスクではできません）
-- `--provision` は含みません。新規 GitHub リポジトリ作成は手動のままです
+- 事前に一度 `sync` または `sync --init` 済みであること（初回の番号選択はタスクではできません）
+- タスクが実行するのは `sync` だけです。AI は使いません
+- `D:\dev` に増えたソースプロジェクトは、この `sync` が自動で対象に入れ、必要なら GitHub も作ります
+- `--disable` したプロジェクトは自動では戻しません
 - Windows にログイン中の方が、GitHub 認証が安定します
 - コンフリクトのプロジェクトは、いつもどおりその件だけ止まります
 

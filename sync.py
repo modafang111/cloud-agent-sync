@@ -108,6 +108,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "provision_non_git": True,
     "ensure_gitignore": True,
     "gitignore_template": "gitignore.template",
+    "auto_add_projects": True,
+    "auto_provision_github": True,
+    "auto_init_non_git": True,
 }
 
 
@@ -116,6 +119,7 @@ class ResultKind(str, Enum):
     PULL = "PULL"
     PUSH = "PUSH"
     SKIP = "SKIP"
+    ADD = "ADD"
     CREATE = "CREATE"
     CONFLICT = "CONFLICT"
     ERROR = "ERROR"
@@ -162,6 +166,9 @@ class AppConfig:
     provision_non_git: bool
     ensure_gitignore: bool
     gitignore_template: Path
+    auto_add_projects: bool = True
+    auto_provision_github: bool = True
+    auto_init_non_git: bool = True
 
 
 @dataclass
@@ -514,6 +521,9 @@ def load_config(path: Path) -> AppConfig:
         gitignore_template=_resolve_gitignore_template(
             path, str(raw.get("gitignore_template", "gitignore.template"))
         ),
+        auto_add_projects=bool(raw.get("auto_add_projects", True)),
+        auto_provision_github=bool(raw.get("auto_provision_github", True)),
+        auto_init_non_git=bool(raw.get("auto_init_non_git", True)),
     )
 
 
@@ -984,7 +994,11 @@ def print_result(result: RepoResult) -> None:
 
 
 def print_summary(results: Sequence[RepoResult]) -> None:
-    success = sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.CREATE})
+    success = sum(
+        1
+        for r in results
+        if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.ADD, ResultKind.CREATE}
+    )
     skip = sum(1 for r in results if r.kind == ResultKind.SKIP)
     conflict = sum(1 for r in results if r.kind == ResultKind.CONFLICT)
     network = sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error)
@@ -1124,6 +1138,9 @@ def cmd_doctor(app: AppConfig, repos_path: Path) -> int:
     print(f"  Python: {sys.version.split()[0]}  ({sys.executable})")
     print(f"  管理ディレクトリ: {SCRIPT_DIR}")
     print(f"  同期ルート: {app.root_dir}  exists={app.root_dir.exists()}")
+    print(f"  新規プロジェクト自動追加: {app.auto_add_projects}")
+    print(f"  新規 GitHub 自動作成: {app.auto_provision_github}")
+    print(f"  Git 未初期化フォルダの自動 init: {app.auto_init_non_git}")
     print(f"  設定: {SCRIPT_DIR / CONFIG_FILE_NAME}  exists={(SCRIPT_DIR / CONFIG_FILE_NAME).is_file()}")
     print(f"  同期対象: {repos_path}  exists={repos_path.is_file()}")
 
@@ -1166,7 +1183,7 @@ def cmd_doctor(app: AppConfig, repos_path: Path) -> int:
             print("  [警告] 自動 commit するには user.name と user.email が必要です。")
             print('         git config --global user.name "Your Name"')
             print('         git config --global user.email "you@example.com"')
-        print("  GitHub リポジトリ未作成のプロジェクトは sync --provision で作成できます")
+        print("  GitHub リポジトリ未作成のプロジェクトは、日常の sync で自動作成します（config でオフにできます）")
 
     if is_windows():
         user_path = os.environ.get("PATH", "")
@@ -1406,6 +1423,160 @@ def should_skip_non_git_dir(path: Path, exclude_names: set[str]) -> bool:
     return False
 
 
+SOURCE_FILE_SUFFIXES = frozenset(
+    {
+        ".py",
+        ".js",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".mjs",
+        ".cjs",
+        ".php",
+        ".go",
+        ".rs",
+        ".java",
+        ".kt",
+        ".cs",
+        ".rb",
+        ".vue",
+        ".svelte",
+        ".css",
+        ".scss",
+        ".html",
+        ".htm",
+        ".c",
+        ".cc",
+        ".cpp",
+        ".h",
+        ".hpp",
+        ".swift",
+        ".sh",
+        ".ps1",
+        ".bat",
+        ".cmd",
+    }
+)
+SOURCE_FILENAMES = frozenset(
+    {
+        "package.json",
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "pyproject.toml",
+        "requirements.txt",
+        "Pipfile",
+        "setup.py",
+        "setup.cfg",
+        "Cargo.toml",
+        "go.mod",
+        "composer.json",
+        "Gemfile",
+        "pom.xml",
+        "build.gradle",
+        "CMakeLists.txt",
+        "Makefile",
+        "makefile",
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.yaml",
+        "index.html",
+        "tsconfig.json",
+    }
+)
+SKIP_WALK_DIR_NAMES = frozenset(
+    {
+        ".git",
+        "node_modules",
+        "vendor",
+        "__pycache__",
+        "venv",
+        ".venv",
+        "env",
+        "dist",
+        "build",
+        "ffmpeg",
+        "logs",
+        "log",
+        "tmp",
+        "temp",
+        ".tox",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".cursor",
+        "out",
+        "coverage",
+    }
+)
+BINARY_SUFFIXES = frozenset({".exe", ".dll", ".so", ".dylib", ".msi", ".bin"})
+TOOL_DIR_NAMES = frozenset({"ffmpeg", "ffprobe", "bin"})
+TOOL_FILE_NAMES = frozenset({"ngrok", "ffmpeg", "ffprobe", "ffplay"})
+WEAK_DOC_NAMES = frozenset({"readme.md", "readme.txt", "license", "license.txt", "license.md", "changelog.md"})
+
+
+def looks_like_tool_dump(path: Path, exclude_names: set[str] | None = None) -> bool:
+    """venv / ffmpeg / exe だけの置き場など、開発プロジェクトではないフォルダ。"""
+    exclude = exclude_names or set()
+    if should_skip_non_git_dir(path, exclude):
+        return True
+    try:
+        children = list(path.iterdir())
+    except OSError:
+        return True
+    visible: list[Path] = []
+    for child in children:
+        if child.name in {".git", ".gitignore"}:
+            continue
+        if child.name.startswith("."):
+            continue
+        if child.name.lower() in WEAK_DOC_NAMES:
+            continue
+        visible.append(child)
+    if not visible:
+        return False
+    for child in visible:
+        if child.is_dir() and child.name.lower() in TOOL_DIR_NAMES | {"logs", "log"}:
+            continue
+        if child.is_file() and child.suffix.lower() in BINARY_SUFFIXES:
+            continue
+        if child.is_file() and child.name.lower() in TOOL_FILE_NAMES:
+            continue
+        return False
+    return True
+
+
+def looks_like_source_project(path: Path, exclude_names: set[str] | None = None, *, max_depth: int = 4) -> bool:
+    """ソースやマニフェストがある開発フォルダか。ffmpeg / venv などは false。"""
+    if looks_like_tool_dump(path, exclude_names):
+        return False
+    try:
+        for root, dirs, files in os.walk(path, followlinks=False):
+            rel = Path(root).relative_to(path)
+            depth = 0 if str(rel) == "." else len(rel.parts)
+            if depth > max_depth:
+                dirs[:] = []
+                continue
+            dirs[:] = [
+                name
+                for name in dirs
+                if name not in SKIP_WALK_DIR_NAMES and (not name.startswith(".") or name == ".github")
+            ]
+            for filename in files:
+                if filename in SOURCE_FILENAMES:
+                    return True
+                lower = filename.lower()
+                if lower in {"dockerfile", "makefile", "rakefile", "gemfile"}:
+                    return True
+                suffix = Path(filename).suffix.lower()
+                if suffix in SOURCE_FILE_SUFFIXES:
+                    return True
+                if suffix == ".md" and lower not in WEAK_DOC_NAMES:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def discover_non_git_projects(root: Path, exclude_names: set[str]) -> list[Path]:
     found: list[Path] = []
     if not root.exists() or not root.is_dir():
@@ -1421,8 +1592,25 @@ def discover_non_git_projects(root: Path, exclude_names: set[str]) -> list[Path]
             continue
         if is_git_repo(child):
             continue
+        if looks_like_tool_dump(child, exclude_names):
+            continue
+        if not looks_like_source_project(child, exclude_names):
+            continue
         found.append(child.resolve())
     return found
+
+
+def path_is_registered(repos: Sequence[RepoConfig], path: Path) -> bool:
+    resolved = path.resolve()
+    name = path.name
+    for repo in repos:
+        try:
+            repo_path = Path(repo.path).expanduser().resolve()
+        except OSError:
+            repo_path = Path(repo.path)
+        if repo_path == resolved or repo.name == name:
+            return True
+    return False
 
 
 def collect_provision_candidates(app: AppConfig, logger: SyncLogger | None = None) -> list[ProvisionCandidate]:
@@ -1676,6 +1864,145 @@ def cmd_provision(
     return 0
 
 
+def auto_enroll_new_projects(
+    app: AppConfig,
+    repos_path: Path,
+    logger: SyncLogger,
+    *,
+    dry_run: bool = False,
+    api: GithubApi | None = None,
+) -> list[RepoResult]:
+    """repositories.json に無い新規ソースプロジェクトを同期対象へ入れる。
+
+    --disable した項目は再有効化しない。venv / logs / ffmpeg 置き場は対象外。
+    """
+    results: list[RepoResult] = []
+    if not app.auto_add_projects:
+        return results
+    if not app.root_dir.exists():
+        return results
+
+    repos = load_repositories(repos_path)
+    added_any = False
+    to_provision: list[ProvisionCandidate] = []
+
+    for path in discover_repos(app.root_dir, app.max_depth, app.exclude_dir_names):
+        if path_is_registered(repos, path):
+            continue
+        if looks_like_tool_dump(path, app.exclude_dir_names):
+            logger.line(f"AUTO_SKIP junk {path}")
+            continue
+        snap = snapshot_repo(
+            path,
+            preferred_remote=app.preferred_remote,
+            fetch=False,
+            fetch_timeout=app.fetch_timeout_seconds,
+            logger=logger,
+        )
+        if not snap.valid:
+            continue
+        if snap.remote_name:
+            if dry_run:
+                result = RepoResult(
+                    kind=ResultKind.ADD,
+                    name=path.name,
+                    path=path,
+                    message=f"dry-run: 同期対象に追加 {path}",
+                )
+                print_result(result)
+                results.append(result)
+                continue
+            repos = upsert_repository(repos, path, enabled=True)
+            added_any = True
+            result = RepoResult(
+                kind=ResultKind.ADD,
+                name=path.name,
+                path=path,
+                message="新規プロジェクトを同期対象に追加",
+            )
+            print_result(result)
+            logger.line(f"AUTO_ADD {path.name} {path}")
+            logger.result(result)
+            results.append(result)
+            continue
+        if not app.auto_provision_github:
+            logger.line(f"AUTO_SKIP no-remote (auto_provision_github=false) {path}")
+            continue
+        if not looks_like_source_project(path, app.exclude_dir_names):
+            logger.line(f"AUTO_SKIP no-remote non-source {path}")
+            continue
+        to_provision.append(
+            ProvisionCandidate(
+                path=path,
+                name=path.name,
+                kind="no_remote",
+                github_name=github_repo_name(path.name),
+                note="ローカル Git あり / GitHub remote なし",
+            )
+        )
+
+    if app.auto_init_non_git and app.auto_provision_github and app.provision_non_git:
+        for path in discover_non_git_projects(app.root_dir, app.exclude_dir_names):
+            if path_is_registered(repos, path):
+                continue
+            to_provision.append(
+                ProvisionCandidate(
+                    path=path,
+                    name=path.name,
+                    kind="not_git",
+                    github_name=github_repo_name(path.name),
+                    note="Git 未初期化",
+                )
+            )
+
+    if to_provision:
+        if dry_run:
+            for item in to_provision:
+                result = RepoResult(
+                    kind=ResultKind.CREATE,
+                    name=item.name,
+                    path=item.path,
+                    message=f"dry-run: {item.kind} → GitHub 作成",
+                )
+                print_result(result)
+                results.append(result)
+        else:
+            host = api
+            if host is None:
+                if not gh_available():
+                    print("GitHub CLI (gh) が無いため、remote 未設定の新規フォルダは作成しません。")
+                    logger.line("AUTO_SKIP provision (gh missing)")
+                else:
+                    host = GhCliGithubApi()
+            if host is not None:
+                try:
+                    owner = app.github_owner or host.current_login()
+                except GitCommandError as exc:
+                    print("GitHub のユーザー名を取得できないため、新規リポジトリ作成をスキップします。")
+                    print(str(exc))
+                    logger.line(f"AUTO_SKIP provision login {exc}")
+                    host = None
+                    owner = ""
+                if host is not None:
+                    print("未登録のソースプロジェクトを GitHub に作成します。")
+                    for item in to_provision:
+                        print(f"---- {item.name} ----")
+                        result = provision_one(item, app, host, owner, logger, dry_run=False)
+                        print_result(result)
+                        logger.result(result)
+                        results.append(result)
+                        if result.kind == ResultKind.CREATE:
+                            repos = upsert_repository(repos, item.path, enabled=True)
+                            added_any = True
+                        print()
+
+    if added_any and not dry_run:
+        save_repositories(repos_path, repos)
+        print(f"同期対象を更新しました: {repos_path}")
+        print()
+    return results
+
+
 def run_sync(
     app: AppConfig,
     repos: Sequence[RepoConfig],
@@ -1710,7 +2037,7 @@ def run_sync(
         "SUMMARY "
         + ", ".join(
             [
-                f"ok={sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.CREATE})}",
+                f"ok={sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.ADD, ResultKind.CREATE})}",
                 f"skip={sum(1 for r in results if r.kind == ResultKind.SKIP)}",
                 f"conflict={sum(1 for r in results if r.kind == ResultKind.CONFLICT)}",
                 f"network={sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error)}",
@@ -1778,7 +2105,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 return 0
             print_discovery_table(snaps)
             print("この検出結果はまだ同期対象ではありません。")
-            print("取り込むには sync --init を実行するか、repositories.json を編集してください。")
+            print("日常の sync が未登録のソースプロジェクトを自動追加します。選び直すなら sync --init です。")
             return 0
 
         if args.list:
@@ -1814,7 +2141,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 1
         if not setup.run_sync:
             return 0
-        return run_sync(app, setup.repos, logger, dry_run=bool(args.dry_run))
+        enroll_failed = False
+        repos = list(setup.repos)
+        if not args.init:
+            enroll_results = auto_enroll_new_projects(
+                app,
+                repos_path,
+                logger,
+                dry_run=bool(args.dry_run),
+            )
+            enroll_failed = any(r.kind == ResultKind.ERROR for r in enroll_results)
+            repos = load_repositories(repos_path) or repos
+        code = run_sync(app, repos, logger, dry_run=bool(args.dry_run))
+        if enroll_failed and code == 0:
+            return 2
+        return code
     finally:
         logger.close()
 
