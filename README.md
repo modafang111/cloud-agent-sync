@@ -288,6 +288,38 @@ sync --doctor    # Git / Python / D:\dev / PATH を点検
 
 `ensure_gitignore` が true のとき、`sync` と `sync --provision` は各プロジェクトの `.gitignore` に管理用ブロックを足します。既存の独自ルールは残します。ログ、venv、`ffmpeg/`、`.env` などは GitHub に送りません。すでに commit 済みの大きなファイルは履歴から自動削除しません。
 
+## Windows タスク登録
+
+このプログラムは AI を使いません。中身は Python と Git（必要なら GitHub CLI）だけです。タスク実行時も AI は呼ばれません。
+
+毎日決まった時刻に `sync` だけ走らせる例:
+
+```powershell
+cd D:\dev\cloud-agent-sync
+git pull
+.\register-task.cmd
+```
+
+既定は毎日 20:00 です。時刻を変える例:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1 -Time 08:30
+```
+
+外すとき:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1 -Unregister
+```
+
+注意:
+
+- 事前に `sync --init` 済みであること（対話入力はタスクではできません）
+- `--provision` は含みません。新規 GitHub リポジトリ作成は手動のままです
+- Windows にログイン中の方が、GitHub 認証が安定します
+- コンフリクトのプロジェクトは、いつもどおりその件だけ止まります
+
+
 ## Cursor Cloud Agent 向け
 
 Cloud Agent はこのリポジトリのプログラムを編集できます。  
