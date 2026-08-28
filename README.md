@@ -281,9 +281,12 @@ sync --doctor    # Git / Python / D:\dev / PATH を点検
 
 | ファイル | 用途 |
 |---|---|
-| `config.json` | 同期ルート（既定 `D:\dev`）、深さ、自動 commit など |
+| `config.json` | 同期ルート（既定 `D:\dev`）、深さ、自動 commit、gitignore など |
+| `gitignore.template` | 各プロジェクトへ入れる「ソース以外を除外」のひな形 |
 | `repositories.json` | 同期対象。初回 `sync` で生成。Git 管理しない（マシン固有） |
 | `repositories.example.json` | 見本 |
+
+`ensure_gitignore` が true のとき、`sync` と `sync --provision` は各プロジェクトの `.gitignore` に管理用ブロックを足します。既存の独自ルールは残します。ログ、venv、`ffmpeg/`、`.env` などは GitHub に送りません。すでに commit 済みの大きなファイルは履歴から自動削除しません。
 
 ## Cursor Cloud Agent 向け
 

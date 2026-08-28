@@ -32,6 +32,7 @@ from sync import (  # noqa: E402
     format_commit_message,
     parse_selection,
     sync_one,
+    commit_if_needed,
 )
 
 
@@ -82,7 +83,7 @@ def write_commit(repo: Path, filename: str, content: str, message: str) -> None:
     git(repo, "-c", "commit.gpgsign=false", "commit", "-m", message)
 
 
-def make_app(tmp: Path, root: Path) -> AppConfig:
+def make_app(tmp: Path, root: Path, *, ensure_gitignore: bool = False) -> AppConfig:
     return AppConfig(
         root_dir=root,
         max_depth=2,
@@ -96,6 +97,8 @@ def make_app(tmp: Path, root: Path) -> AppConfig:
         github_owner="test-owner",
         new_repo_private=True,
         provision_non_git=True,
+        ensure_gitignore=ensure_gitignore,
+        gitignore_template=ROOT / "gitignore.template",
     )
 
 
@@ -398,6 +401,40 @@ class FakeGithubApi(syncmod.GithubApi):
         self.created.append(name)
         self.existing[name] = syncmod.GithubRepoInfo(exists=True, empty=True, url=url)
         return url
+
+
+class GitignoreTests(unittest.TestCase):
+    def test_ensure_gitignore_preserves_custom_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            repo = init_repo(tmp / "app")
+            (repo / ".gitignore").write_text("custom.bin\n", encoding="utf-8")
+            app = make_app(tmp, tmp, ensure_gitignore=True)
+            self.assertTrue(syncmod.ensure_gitignore(repo, app))
+            text = (repo / ".gitignore").read_text(encoding="utf-8")
+            self.assertIn("custom.bin", text)
+            self.assertIn("cloud-agent-sync", text)
+            self.assertIn("logs/", text)
+            self.assertFalse(syncmod.ensure_gitignore(repo, app))
+
+    def test_commit_skips_logs_and_venv(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            repo = init_repo(tmp / "app")
+            write_commit(repo, "main.py", "print(1)\n", "src")
+            (repo / "logs").mkdir()
+            (repo / "logs" / "run.log").write_text("secret\n", encoding="utf-8")
+            (repo / ".venv").mkdir()
+            (repo / ".venv" / "pyvenv.cfg").write_text("home = .\n", encoding="utf-8")
+            app = make_app(tmp, tmp, ensure_gitignore=True)
+            syncmod.ensure_gitignore(repo, app)
+            client = GitClient(repo)
+            self.assertTrue(commit_if_needed(client, "ignore generated files"))
+            files = git(repo, "ls-files").stdout.splitlines()
+            self.assertIn("main.py", files)
+            self.assertIn(".gitignore", files)
+            self.assertFalse(any(name.startswith("logs/") for name in files))
+            self.assertFalse(any(".venv" in name for name in files))
 
 
 class ProvisionTests(unittest.TestCase):

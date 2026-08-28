@@ -106,6 +106,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "github_owner": "",
     "new_repo_private": True,
     "provision_non_git": True,
+    "ensure_gitignore": True,
+    "gitignore_template": "gitignore.template",
 }
 
 
@@ -158,6 +160,8 @@ class AppConfig:
     github_owner: str
     new_repo_private: bool
     provision_non_git: bool
+    ensure_gitignore: bool
+    gitignore_template: Path
 
 
 @dataclass
@@ -506,7 +510,64 @@ def load_config(path: Path) -> AppConfig:
         github_owner=str(raw.get("github_owner", "")).strip(),
         new_repo_private=bool(raw.get("new_repo_private", True)),
         provision_non_git=bool(raw.get("provision_non_git", True)),
+        ensure_gitignore=bool(raw.get("ensure_gitignore", True)),
+        gitignore_template=_resolve_gitignore_template(
+            path, str(raw.get("gitignore_template", "gitignore.template"))
+        ),
     )
+
+
+GITIGNORE_BEGIN = "# --- cloud-agent-sync ---"
+GITIGNORE_END = "# --- end cloud-agent-sync ---"
+
+
+def _resolve_gitignore_template(config_path: Path, raw: str) -> Path:
+    template = Path(raw)
+    if not template.is_absolute():
+        template = config_path.parent / template
+    return template
+
+
+def load_gitignore_template(app: AppConfig) -> str:
+    path = app.gitignore_template
+    if path.is_file():
+        return path.read_text(encoding="utf-8", errors="replace")
+    fallback = SCRIPT_DIR / "gitignore.template"
+    if fallback.is_file():
+        return fallback.read_text(encoding="utf-8", errors="replace")
+    return ""
+
+
+def gitignore_managed_block(template: str) -> str:
+    body = template.strip()
+    if not body:
+        return ""
+    return f"{GITIGNORE_BEGIN}\n{body}\n{GITIGNORE_END}\n"
+
+
+def ensure_gitignore(repo: Path, app: AppConfig) -> bool:
+    if not app.ensure_gitignore:
+        return False
+    block = gitignore_managed_block(load_gitignore_template(app))
+    if not block:
+        return False
+    gitignore = repo / ".gitignore"
+    existing = ""
+    if gitignore.is_file():
+        existing = gitignore.read_text(encoding="utf-8", errors="replace")
+    if GITIGNORE_BEGIN in existing and GITIGNORE_END in existing:
+        prefix = existing.split(GITIGNORE_BEGIN, 1)[0].rstrip()
+        suffix = existing.split(GITIGNORE_END, 1)[1].lstrip("\r\n")
+        parts = [part for part in (prefix, block.rstrip("\n"), suffix) if part]
+        updated = "\n\n".join(parts).rstrip() + "\n"
+    elif existing.strip():
+        updated = existing.rstrip() + "\n\n" + block
+    else:
+        updated = block
+    if existing.replace("\r\n", "\n") == updated.replace("\r\n", "\n"):
+        return False
+    gitignore.write_text(updated, encoding="utf-8", newline="\n")
+    return True
 
 
 def load_repositories(path: Path) -> list[RepoConfig]:
@@ -723,6 +784,9 @@ def sync_one(
         result.message = "パスが存在しません"
         result.details.append(str(path))
         return result
+
+    if not dry_run:
+        ensure_gitignore(path, app)
 
     try:
         snap = snapshot_repo(
@@ -1443,6 +1507,7 @@ def provision_one(
             result.message = "すでに remote があるため新規作成しません（既存 remote は変更しません）"
             return result
 
+        ensure_gitignore(path, app)
         head = git.try_capture(["rev-parse", "HEAD"])
         dirty = bool(git.try_capture(["status", "--porcelain"]))
         if dirty:
