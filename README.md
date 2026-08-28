@@ -41,6 +41,8 @@ cd cloud-agent-sync
 .\install.cmd
 ```
 
+日本語 Windows の Windows PowerShell 5.1 では、UTF-8 の `.ps1` が文字化けして構文エラーになることがあります。このリポジトリの `install.ps1` は UTF-8 BOM 付きです。もし古い版でエラーになったら、最新を `git pull` してから `.\install.cmd` を再実行してください。PowerShell Profile は変更しません。
+
 3. **Cursor とターミナルを再起動** します。
 4. 動作確認します。
 

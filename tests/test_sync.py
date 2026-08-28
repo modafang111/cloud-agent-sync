@@ -207,6 +207,14 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(parse_selection("9", 3))
         self.assertIsNone(parse_selection("nope", 3))
 
+    def test_install_ps1_has_utf8_bom_and_safe_quotes(self) -> None:
+        data = (ROOT / "install.ps1").read_bytes()
+        self.assertTrue(data.startswith(b"\xef\xbb\xbf"), "Windows PowerShell 5.1 needs UTF-8 BOM")
+        text = data.decode("utf-8-sig")
+        self.assertIn("TrimEnd('\\')", text)
+        self.assertNotIn('TrimEnd("\\")', text)
+        self.assertNotIn("は変更していません", text)
+
     def test_commit_message_format(self) -> None:
         when = datetime(2026, 8, 28, 21, 7, 9)
         self.assertEqual(
