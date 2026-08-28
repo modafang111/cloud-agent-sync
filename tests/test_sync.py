@@ -483,10 +483,16 @@ class ProvisionTests(unittest.TestCase):
             (root / "plain").mkdir()
             init_repo(root / "already-git")
             (root / "node_modules").mkdir()
-            found = {p.name for p in syncmod.discover_non_git_projects(root, {"node_modules", ".git"})}
+            (root / "logs").mkdir()
+            venv_dir = root / "app.venv"
+            venv_dir.mkdir()
+            (venv_dir / "pyvenv.cfg").write_text("home = .\n", encoding="utf-8")
+            found = {p.name for p in syncmod.discover_non_git_projects(root, {"node_modules", ".git", "logs"})}
             self.assertIn("plain", found)
             self.assertNotIn("already-git", found)
             self.assertNotIn("node_modules", found)
+            self.assertNotIn("logs", found)
+            self.assertNotIn("app.venv", found)
 
 
 if __name__ == "__main__":

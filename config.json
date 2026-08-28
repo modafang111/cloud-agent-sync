@@ -22,6 +22,10 @@
     ".tox",
     ".mypy_cache",
     ".pytest_cache",
-    ".cursor"
+    ".cursor",
+    "logs",
+    "log",
+    "tmp",
+    "temp"
   ]
 }

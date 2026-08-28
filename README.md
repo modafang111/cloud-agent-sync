@@ -190,14 +190,10 @@ GitHub リポジトリが無いもの、Git 自体が無いフォルダは、次
 sync --provision
 ```
 
-確認画面のあと、次を行います。
+確認画面のあと、番号で作成するプロジェクトを選びます。
 
-1. `D:\dev` 直下で Git 未初期化のフォルダを `git init`
-2. Git はあるが remote が無いプロジェクトを検出
-3. GitHub に同名リポジトリが無ければ **新規作成**（既定は private）
-4. 既存の中身がある GitHub リポジトリには接続しない（履歴衝突を避ける）
-5. `git remote add origin` して push
-6. `repositories.json` の同期対象に追加
+- Git はあるが remote が無いもの
+- `D:\dev` 直下で Git 未初期化の開発フォルダ（venv / logs は除外）
 
 すでに remote があるプロジェクトは変更しません。
 

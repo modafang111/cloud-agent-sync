@@ -97,6 +97,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ".mypy_cache",
         ".pytest_cache",
         ".cursor",
+        "logs",
+        "log",
+        "tmp",
+        "temp",
     ],
     "preferred_remote": "origin",
     "github_owner": "",
@@ -1266,6 +1270,7 @@ class GhCliGithubApi(GithubApi):
             timeout=timeout,
             check=False,
             env=env,
+            stdin=subprocess.DEVNULL,
         )
         return completed
 
@@ -1295,7 +1300,7 @@ class GhCliGithubApi(GithubApi):
 
     def create(self, owner: str, name: str, private: bool) -> str:
         visibility = "--private" if private else "--public"
-        completed = self._run(["repo", "create", f"{owner}/{name}", visibility, "--yes"], timeout=180)
+        completed = self._run(["repo", "create", f"{owner}/{name}", visibility], timeout=180)
         if completed.returncode != 0:
             raise GitCommandError(
                 (completed.stderr or completed.stdout or "gh repo create に失敗しました").strip(),
@@ -1321,6 +1326,22 @@ def github_repo_name(folder: str) -> str:
     return name or "project"
 
 
+def looks_like_virtualenv(path: Path) -> bool:
+    name = path.name.lower()
+    if name.endswith(".venv") or name in {".venv", "venv", "env"}:
+        return True
+    return (path / "pyvenv.cfg").is_file()
+
+
+def should_skip_non_git_dir(path: Path, exclude_names: set[str]) -> bool:
+    name = path.name
+    if name in exclude_names or name.startswith("."):
+        return True
+    if looks_like_virtualenv(path):
+        return True
+    return False
+
+
 def discover_non_git_projects(root: Path, exclude_names: set[str]) -> list[Path]:
     found: list[Path] = []
     if not root.exists() or not root.is_dir():
@@ -1332,7 +1353,7 @@ def discover_non_git_projects(root: Path, exclude_names: set[str]) -> list[Path]
     for child in children:
         if not child.is_dir() or child.is_symlink():
             continue
-        if child.name in exclude_names or child.name.startswith("."):
+        if should_skip_non_git_dir(child, exclude_names):
             continue
         if is_git_repo(child):
             continue
@@ -1529,30 +1550,44 @@ def cmd_provision(
         print("新規作成が必要なプロジェクトはありません。")
         return 0
 
-    print("作成対象:")
+    print("作成候補:")
     for index, item in enumerate(candidates, start=1):
         print(f"  {index:>3}. {item.name:<28}  {item.path}")
         print(f"       {item.note}  →  https://github.com/{owner}/{item.github_name}")
     print()
+    print("venv / logs などの作業フォルダは除外済みです。")
+    print("Git 未初期化の行は、本当に開発プロジェクトのものだけ選んでください。")
+    print("例: 1,2   1-3   all   （やめる場合は q）")
 
-    if not yes and stdin_is_tty():
-        try:
-            answer = input("これらの GitHub リポジトリを作成しますか? [y/N] ").strip().lower()
-        except EOFError:
-            answer = "n"
-        if answer not in {"y", "yes"}:
+    if yes:
+        selected = [item for item in candidates if item.kind == "no_remote"]
+        if not selected:
+            print("--yes では「Git あり / remote なし」だけを自動作成します。該当がありません。")
+            return 0
+        print("確認省略: remote が無い Git プロジェクトだけ作成します。")
+    elif stdin_is_tty():
+        while True:
+            try:
+                answer = input("> ").strip()
+            except EOFError:
+                print("中止しました。")
+                return 0
+            parsed = parse_selection(answer, len(candidates))
+            if parsed is None:
+                print("入力を解釈できません。番号、範囲、all、q のいずれかを指定してください。")
+                continue
+            selected = [candidates[i - 1] for i in parsed]
+            break
+        if not selected:
             print("中止しました。")
             return 0
-    elif not yes:
-        print("対話入力ができないため中止しました。確認付きで実行するには:")
-        print("  sync --provision")
-        print("確認を省略するには:")
-        print("  sync --provision --yes")
+    else:
+        print("対話入力ができないため中止しました。ターミナルで sync --provision を実行してください。")
         return 0
 
     results: list[RepoResult] = []
     repos = load_repositories(repos_path)
-    for item in candidates:
+    for item in selected:
         print(f"---- {item.name} ----")
         result = provision_one(item, app, host, owner, logger, dry_run=dry_run)
         print_result(result)
