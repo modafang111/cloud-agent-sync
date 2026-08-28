@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "updated_at": "2026-08-28T00:00:00+09:00",
+  "comment": "このファイルは見本です。実際の同期対象は repositories.json に保存されます。初回の sync または sync --init で自動生成されます。",
+  "repositories": [
+    {
+      "name": "project-a",
+      "path": "D:\\dev\\project-a",
+      "enabled": true
+    },
+    {
+      "name": "project-b",
+      "path": "D:\\dev\\project-b",
+      "enabled": true
+    },
+    {
+      "name": "cloud-agent-sync",
+      "path": "D:\\dev\\cloud-agent-sync",
+      "enabled": true
+    }
+  ]
+}

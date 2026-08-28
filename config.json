@@ -1,0 +1,24 @@
+{
+  "root_dir": "D:\\dev",
+  "max_depth": 2,
+  "auto_commit": true,
+  "commit_message_format": "auto sync {timestamp}",
+  "fetch_timeout_seconds": 120,
+  "push_timeout_seconds": 120,
+  "log_dir": "logs",
+  "preferred_remote": "origin",
+  "exclude_dir_names": [
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "env",
+    "__pycache__",
+    "dist",
+    "build",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".cursor"
+  ]
+}
