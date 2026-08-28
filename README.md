@@ -312,7 +312,7 @@ sync --doctor    # Git / Python / D:\dev / PATH を点検
 
 このプログラムは AI を使いません。中身は Python と Git（必要なら GitHub CLI）だけです。タスク実行時も AI は呼ばれません。
 
-毎日決まった時刻に `sync` だけ走らせる例:
+毎週日曜 23:00 に `sync` だけ走らせるバッチです。一度だけ実行します。
 
 ```powershell
 cd D:\dev\cloud-agent-sync
@@ -320,17 +320,19 @@ git pull
 .\register-task.cmd
 ```
 
-既定は毎日 20:00 です。時刻を変える例:
+同じ名前の古いタスク（毎日 20:00 など）があれば上書きします。時刻だけ変える例:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1 -Time 08:30
+.\register-task.cmd 22:30
 ```
 
 外すとき:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\register-task.ps1 -Unregister
+.\register-task.cmd /unregister
 ```
+
+タスクが実際に起動するファイルは `run-sync-task.cmd` です。`sync` だけ呼び、`--init` は使いません。
 
 注意:
 

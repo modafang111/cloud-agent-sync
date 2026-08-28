@@ -231,6 +231,23 @@ class HelperTests(unittest.TestCase):
         self.assertNotIn('TrimEnd("\\")', text)
         self.assertNotIn("は変更していません", text)
 
+    def test_register_task_cmd_is_weekly_sunday_batch(self) -> None:
+        cmd = (ROOT / "register-task.cmd").read_text(encoding="utf-8")
+        self.assertIn("schtasks", cmd.lower())
+        self.assertIn("/SC WEEKLY", cmd)
+        self.assertIn("/D SUN", cmd)
+        self.assertIn("23:00", cmd)
+        self.assertIn("run-sync-task.cmd", cmd)
+        self.assertNotIn("powershell", cmd.lower())
+        runner = (ROOT / "run-sync-task.cmd").read_text(encoding="utf-8")
+        self.assertIn("bin\\sync.cmd", runner)
+        ps1 = (ROOT / "register-task.ps1").read_bytes()
+        self.assertTrue(ps1.startswith(b"\xef\xbb\xbf"), "Windows PowerShell 5.1 needs UTF-8 BOM")
+        ps1_text = ps1.decode("utf-8-sig")
+        self.assertIn("-Weekly", ps1_text)
+        self.assertIn("Sunday", ps1_text)
+        self.assertIn("23:00", ps1_text)
+
     def test_commit_message_format(self) -> None:
         when = datetime(2026, 8, 28, 21, 7, 9)
         self.assertEqual(
