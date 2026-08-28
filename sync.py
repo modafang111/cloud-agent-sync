@@ -46,6 +46,7 @@ ALLOWED_GIT_VERBS = frozenset(
         "cat-file",
         "diff-index",
         "name-rev",
+        "init",
     }
 )
 
@@ -98,6 +99,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         ".cursor",
     ],
     "preferred_remote": "origin",
+    "github_owner": "",
+    "new_repo_private": True,
+    "provision_non_git": True,
 }
 
 
@@ -106,6 +110,7 @@ class ResultKind(str, Enum):
     PULL = "PULL"
     PUSH = "PUSH"
     SKIP = "SKIP"
+    CREATE = "CREATE"
     CONFLICT = "CONFLICT"
     ERROR = "ERROR"
 
@@ -146,6 +151,9 @@ class AppConfig:
     log_dir: Path
     exclude_dir_names: set[str]
     preferred_remote: str
+    github_owner: str
+    new_repo_private: bool
+    provision_non_git: bool
 
 
 @dataclass
@@ -344,6 +352,19 @@ def assert_safe_git_args(args: Sequence[str]) -> None:
     if verb in {"reset", "clean", "rebase", "checkout", "switch", "restore", "stash"}:
         raise UnsafeGitCommandError(f"{verb} は許可されていません")
 
+    if verb == "init":
+        if "--bare" in joined or any(x.startswith("--template") for x in joined):
+            raise UnsafeGitCommandError("許可されていない init オプションです")
+        return
+
+    if verb == "remote":
+        rest = list(args[1:])
+        if rest in ([], ["-v"]):
+            return
+        if len(rest) == 3 and rest[0] == "add" and rest[1] == "origin":
+            return
+        raise UnsafeGitCommandError("remote の変更は add origin 以外禁止です")
+
     if verb == "add" and any(x.startswith("--force") or x == "-f" for x in joined):
         raise UnsafeGitCommandError("git add --force は禁止です")
 
@@ -443,7 +464,7 @@ class SyncLogger:
         self.line(f"{project} ACTION {text}")
 
     def result(self, result: RepoResult) -> None:
-        status = "SUCCESS" if result.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.SKIP} else "FAILURE"
+        status = "SUCCESS" if result.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.SKIP, ResultKind.CREATE} else "FAILURE"
         self.line(
             f"{result.name} RESULT kind={result.kind.value} status={status} branch={result.branch} path={result.path}"
         )
@@ -478,6 +499,9 @@ def load_config(path: Path) -> AppConfig:
         log_dir=log_dir,
         exclude_dir_names=exclude,
         preferred_remote=str(raw.get("preferred_remote", "origin")),
+        github_owner=str(raw.get("github_owner", "")).strip(),
+        new_repo_private=bool(raw.get("new_repo_private", True)),
+        provision_non_git=bool(raw.get("provision_non_git", True)),
     )
 
 
@@ -752,7 +776,7 @@ def sync_one(
         result.git_state = status_text(snap)
         return result
     if decision == Decision.ERROR_NO_REMOTE:
-        result.message = "remote が設定されていないため同期を停止しました"
+        result.message = "remote がありません。sync --provision で GitHub リポジトリを作成できます"
         return result
     if decision == Decision.ERROR_NO_REMOTE_BRANCH:
         result.message = (
@@ -892,7 +916,7 @@ def print_result(result: RepoResult) -> None:
 
 
 def print_summary(results: Sequence[RepoResult]) -> None:
-    success = sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH})
+    success = sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.CREATE})
     skip = sum(1 for r in results if r.kind == ResultKind.SKIP)
     conflict = sum(1 for r in results if r.kind == ResultKind.CONFLICT)
     network = sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error)
@@ -1074,6 +1098,7 @@ def cmd_doctor(app: AppConfig, repos_path: Path) -> int:
             print("  [警告] 自動 commit するには user.name と user.email が必要です。")
             print('         git config --global user.name "Your Name"')
             print('         git config --global user.email "you@example.com"')
+        print("  GitHub リポジトリ未作成のプロジェクトは sync --provision で作成できます")
 
     if is_windows():
         user_path = os.environ.get("PATH", "")
@@ -1209,6 +1234,348 @@ def set_enabled(repos_path: Path, name: str, enabled: bool) -> int:
     return 0
 
 
+@dataclass
+class GithubRepoInfo:
+    exists: bool
+    empty: bool = True
+    url: str = ""
+
+
+class GithubApi:
+    def current_login(self) -> str:
+        raise NotImplementedError
+
+    def inspect(self, owner: str, name: str) -> GithubRepoInfo:
+        raise NotImplementedError
+
+    def create(self, owner: str, name: str, private: bool) -> str:
+        raise NotImplementedError
+
+
+class GhCliGithubApi(GithubApi):
+    def _run(self, args: Sequence[str], timeout: int = 120) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env.setdefault("GH_PROMPT_DISABLED", "1")
+        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        completed = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            check=False,
+            env=env,
+        )
+        return completed
+
+    def current_login(self) -> str:
+        completed = self._run(["api", "user", "--jq", ".login"])
+        if completed.returncode != 0:
+            raise GitCommandError(
+                (completed.stderr or completed.stdout or "gh api user に失敗しました").strip(),
+                completed.stderr or "",
+                completed.returncode,
+            )
+        return completed.stdout.strip()
+
+    def inspect(self, owner: str, name: str) -> GithubRepoInfo:
+        completed = self._run(["repo", "view", f"{owner}/{name}", "--json", "url,isEmpty"])
+        if completed.returncode != 0:
+            return GithubRepoInfo(exists=False)
+        try:
+            payload = json.loads(completed.stdout or "{}")
+        except json.JSONDecodeError:
+            return GithubRepoInfo(exists=True, empty=False)
+        return GithubRepoInfo(
+            exists=True,
+            empty=bool(payload.get("isEmpty", False)),
+            url=str(payload.get("url") or f"https://github.com/{owner}/{name}.git"),
+        )
+
+    def create(self, owner: str, name: str, private: bool) -> str:
+        visibility = "--private" if private else "--public"
+        completed = self._run(["repo", "create", f"{owner}/{name}", visibility, "--yes"], timeout=180)
+        if completed.returncode != 0:
+            raise GitCommandError(
+                (completed.stderr or completed.stdout or "gh repo create に失敗しました").strip(),
+                completed.stderr or "",
+                completed.returncode,
+            )
+        info = self.inspect(owner, name)
+        return info.url or f"https://github.com/{owner}/{name}.git"
+
+
+@dataclass
+class ProvisionCandidate:
+    path: Path
+    name: str
+    kind: str
+    github_name: str
+    note: str = ""
+
+
+def github_repo_name(folder: str) -> str:
+    name = re.sub(r"[^A-Za-z0-9._-]+", "-", folder.strip())
+    name = name.strip(".-")
+    return name or "project"
+
+
+def discover_non_git_projects(root: Path, exclude_names: set[str]) -> list[Path]:
+    found: list[Path] = []
+    if not root.exists() or not root.is_dir():
+        return found
+    try:
+        children = sorted(root.iterdir(), key=lambda p: p.name.lower())
+    except OSError:
+        return found
+    for child in children:
+        if not child.is_dir() or child.is_symlink():
+            continue
+        if child.name in exclude_names or child.name.startswith("."):
+            continue
+        if is_git_repo(child):
+            continue
+        found.append(child.resolve())
+    return found
+
+
+def collect_provision_candidates(app: AppConfig, logger: SyncLogger | None = None) -> list[ProvisionCandidate]:
+    candidates: list[ProvisionCandidate] = []
+    for path in discover_repos(app.root_dir, app.max_depth, app.exclude_dir_names):
+        snap = snapshot_repo(
+            path,
+            preferred_remote=app.preferred_remote,
+            fetch=False,
+            fetch_timeout=app.fetch_timeout_seconds,
+            logger=logger,
+        )
+        if snap.valid and not snap.remote_name:
+            candidates.append(
+                ProvisionCandidate(
+                    path=path,
+                    name=path.name,
+                    kind="no_remote",
+                    github_name=github_repo_name(path.name),
+                    note="ローカル Git あり / GitHub remote なし",
+                )
+            )
+    if app.provision_non_git:
+        for path in discover_non_git_projects(app.root_dir, app.exclude_dir_names):
+            candidates.append(
+                ProvisionCandidate(
+                    path=path,
+                    name=path.name,
+                    kind="not_git",
+                    github_name=github_repo_name(path.name),
+                    note="Git 未初期化",
+                )
+            )
+    return candidates
+
+
+def upsert_repository(repos: list[RepoConfig], path: Path, enabled: bool = True) -> list[RepoConfig]:
+    resolved = path.resolve()
+    for repo in repos:
+        if Path(repo.path).resolve() == resolved:
+            repo.enabled = enabled
+            repo.name = repo.name or path.name
+            return repos
+    repos.append(RepoConfig(name=path.name, path=str(resolved), enabled=enabled))
+    return repos
+
+
+def provision_one(
+    candidate: ProvisionCandidate,
+    app: AppConfig,
+    api: GithubApi,
+    owner: str,
+    logger: SyncLogger,
+    *,
+    dry_run: bool,
+) -> RepoResult:
+    path = candidate.path
+    result = RepoResult(kind=ResultKind.ERROR, name=candidate.name, path=path)
+    github_name = candidate.github_name
+    clone_url = f"https://github.com/{owner}/{github_name}.git"
+
+    if dry_run:
+        result.kind = ResultKind.CREATE
+        result.message = f"dry-run: {candidate.kind} → {owner}/{github_name}"
+        return result
+
+    try:
+        if candidate.kind == "not_git":
+            if is_git_repo(path):
+                result.message = "すでに Git リポジトリです。remote だけ作成します"
+            else:
+                git = GitClient(path, logger=logger)
+                git.run(["init", "-b", "main"])
+
+        if not is_git_repo(path):
+            result.message = "git init に失敗しました"
+            return result
+
+        git = GitClient(path, logger=logger)
+        remotes = parse_remotes(git.try_capture(["remote", "-v"]))
+        if remotes:
+            result.message = "すでに remote があるため新規作成しません（既存 remote は変更しません）"
+            return result
+
+        head = git.try_capture(["rev-parse", "HEAD"])
+        dirty = bool(git.try_capture(["status", "--porcelain"]))
+        if dirty:
+            if not has_git_identity(path):
+                result.identity_error = True
+                result.message = IDENTITY_MISSING_MESSAGE
+                return result
+            message = "initial commit" if not head else format_commit_message(app.commit_message_format)
+            commit_if_needed(git, message)
+            head = git.try_capture(["rev-parse", "HEAD"])
+
+        info = api.inspect(owner, github_name)
+        created = False
+        if info.exists and not info.empty:
+            result.message = (
+                f"GitHub に {owner}/{github_name} が既にあり、空ではありません。"
+                "履歴が衝突する可能性があるため接続しません"
+            )
+            return result
+        if not info.exists:
+            clone_url = api.create(owner, github_name, app.new_repo_private) or clone_url
+            if not clone_url.endswith(".git"):
+                clone_url = clone_url.rstrip("/") + ".git"
+            created = True
+        elif info.url:
+            clone_url = info.url if info.url.endswith(".git") else info.url.rstrip("/") + ".git"
+
+        git.run(["remote", "add", "origin", clone_url])
+        head = git.try_capture(["rev-parse", "HEAD"])
+        branch = git.try_capture(["branch", "--show-current"]) or "main"
+        if head:
+            git.run(
+                ["push", "origin", f"HEAD:refs/heads/{branch}"],
+                timeout=app.push_timeout_seconds,
+            )
+            result.actions.append(f"push origin HEAD:refs/heads/{branch}")
+        result.kind = ResultKind.CREATE
+        result.branch = branch
+        if created:
+            result.message = f"GitHub リポジトリ {owner}/{github_name} を作成し、同期対象に追加"
+        else:
+            result.message = f"空の GitHub リポジトリ {owner}/{github_name} に接続し、同期対象に追加"
+        result.details.append(clone_url)
+        return result
+    except (GitCommandError, UnsafeGitCommandError, OSError) as exc:
+        text = str(exc)
+        result.message = text.splitlines()[0] if text else "新規作成に失敗しました"
+        result.network_error = looks_like_network_error(text)
+        result.identity_error = looks_like_identity_error(text)
+        result.details.append(text)
+        return result
+
+
+def gh_available() -> bool:
+    try:
+        completed = subprocess.run(
+            ["gh", "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        return completed.returncode == 0
+    except FileNotFoundError:
+        return False
+
+
+def cmd_provision(
+    app: AppConfig,
+    repos_path: Path,
+    logger: SyncLogger,
+    *,
+    yes: bool,
+    dry_run: bool,
+    api: GithubApi | None = None,
+) -> int:
+    print_banner()
+    print("GitHub リポジトリが無いプロジェクトを新規作成し、同期対象に追加します。")
+    print("すでに remote があるプロジェクトは変更しません。")
+    print()
+
+    if not gh_available() and api is None:
+        print("GitHub CLI (gh) が見つかりません。gh がログイン済みである必要があります。")
+        return 1
+    if not app.root_dir.exists():
+        print(f"{app.root_dir} が存在しません。")
+        return 1
+
+    host = api or GhCliGithubApi()
+    try:
+        owner = app.github_owner or host.current_login()
+    except GitCommandError as exc:
+        print("GitHub のユーザー名を取得できません。gh auth login を確認してください。")
+        print(str(exc))
+        return 1
+
+    visibility = "private" if app.new_repo_private else "public"
+    print(f"GitHub アカウント: {owner}")
+    print(f"新規リポジトリの公開範囲: {visibility}")
+    print()
+
+    candidates = collect_provision_candidates(app, logger)
+    if not candidates:
+        print("新規作成が必要なプロジェクトはありません。")
+        return 0
+
+    print("作成対象:")
+    for index, item in enumerate(candidates, start=1):
+        print(f"  {index:>3}. {item.name:<28}  {item.path}")
+        print(f"       {item.note}  →  https://github.com/{owner}/{item.github_name}")
+    print()
+
+    if not yes and stdin_is_tty():
+        try:
+            answer = input("これらの GitHub リポジトリを作成しますか? [y/N] ").strip().lower()
+        except EOFError:
+            answer = "n"
+        if answer not in {"y", "yes"}:
+            print("中止しました。")
+            return 0
+    elif not yes:
+        print("対話入力ができないため中止しました。確認付きで実行するには:")
+        print("  sync --provision")
+        print("確認を省略するには:")
+        print("  sync --provision --yes")
+        return 0
+
+    results: list[RepoResult] = []
+    repos = load_repositories(repos_path)
+    for item in candidates:
+        print(f"---- {item.name} ----")
+        result = provision_one(item, app, host, owner, logger, dry_run=dry_run)
+        print_result(result)
+        logger.result(result)
+        results.append(result)
+        if result.kind == ResultKind.CREATE and not dry_run:
+            repos = upsert_repository(repos, item.path, enabled=True)
+        print()
+
+    if not dry_run:
+        save_repositories(repos_path, repos)
+        print(f"設定を更新しました: {repos_path}")
+
+    print_summary(results)
+    created = sum(1 for r in results if r.kind == ResultKind.CREATE)
+    print(f"新規作成：{created}件")
+    print()
+    print("以後は通常どおり sync だけ実行してください。")
+    if any(r.kind in {ResultKind.CONFLICT, ResultKind.ERROR} for r in results):
+        return 2
+    return 0
+
+
 def run_sync(
     app: AppConfig,
     repos: Sequence[RepoConfig],
@@ -1243,7 +1610,7 @@ def run_sync(
         "SUMMARY "
         + ", ".join(
             [
-                f"ok={sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH})}",
+                f"ok={sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.CREATE})}",
                 f"skip={sum(1 for r in results if r.kind == ResultKind.SKIP)}",
                 f"conflict={sum(1 for r in results if r.kind == ResultKind.CONFLICT)}",
                 f"network={sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error)}",
@@ -1271,6 +1638,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--remove", metavar="NAME_OR_PATH", help="同期対象から外す")
     parser.add_argument("--enable", metavar="NAME", help="登録済みリポジトリを有効化")
     parser.add_argument("--disable", metavar="NAME", help="登録済みリポジトリを無効化（削除はしない）")
+    parser.add_argument("--provision", action="store_true", help="GitHub リポジトリが無いプロジェクトを新規作成して同期対象に入れる")
+    parser.add_argument("--yes", action="store_true", help="確認質問を省略する（--provision 用）")
     parser.add_argument("--dry-run", action="store_true", help="判定のみ。commit/merge/push しない")
     parser.add_argument("--doctor", action="store_true", help="Git / 設定 / ルートディレクトリを点検")
     parser.add_argument("--config", default=str(SCRIPT_DIR / CONFIG_FILE_NAME), help="config.json のパス")
@@ -1331,6 +1700,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             return set_enabled(repos_path, args.enable, True)
         if args.disable:
             return set_enabled(repos_path, args.disable, False)
+        if args.provision:
+            return cmd_provision(
+                app,
+                repos_path,
+                logger,
+                yes=bool(args.yes),
+                dry_run=bool(args.dry_run),
+            )
 
         setup = ensure_repos_configured(app, repos_path, logger, force_init=bool(args.init))
         if setup is None:

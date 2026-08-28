@@ -93,6 +93,9 @@ def make_app(tmp: Path, root: Path) -> AppConfig:
         log_dir=tmp / "logs",
         exclude_dir_names={"node_modules", ".git", ".venv"},
         preferred_remote="origin",
+        github_owner="test-owner",
+        new_repo_private=True,
+        provision_non_git=True,
     )
 
 
@@ -152,6 +155,16 @@ class SafetyTests(unittest.TestCase):
         with self.assertRaises(UnsafeGitCommandError):
             client.run(["push", "--force", "origin", "main"])
         self.assertEqual(client.executed, [])
+
+    def test_remote_add_origin_allowed_other_remote_writes_blocked(self) -> None:
+        assert_safe_git_args(["remote", "-v"])
+        assert_safe_git_args(["remote", "add", "origin", "https://github.com/example/app.git"])
+        with self.assertRaises(UnsafeGitCommandError):
+            assert_safe_git_args(["remote", "set-url", "origin", "https://example.invalid/app.git"])
+        with self.assertRaises(UnsafeGitCommandError):
+            assert_safe_git_args(["remote", "remove", "origin"])
+        with self.assertRaises(UnsafeGitCommandError):
+            assert_safe_git_args(["init", "--bare"])
 
 
 class DecisionTests(unittest.TestCase):
@@ -365,6 +378,115 @@ class IntegrationTests(unittest.TestCase):
             payload = json.loads(repos_file.read_text(encoding="utf-8"))
             self.assertTrue(payload["repositories"])
             self.assertTrue(all(not item["enabled"] for item in payload["repositories"]))
+
+
+class FakeGithubApi(syncmod.GithubApi):
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.created: list[str] = []
+        self.existing: dict[str, syncmod.GithubRepoInfo] = {}
+
+    def current_login(self) -> str:
+        return "test-owner"
+
+    def inspect(self, owner: str, name: str) -> syncmod.GithubRepoInfo:
+        return self.existing.get(name, syncmod.GithubRepoInfo(exists=False))
+
+    def create(self, owner: str, name: str, private: bool) -> str:
+        bare = init_repo(self.root / f"{name}.git", bare=True)
+        url = str(bare)
+        self.created.append(name)
+        self.existing[name] = syncmod.GithubRepoInfo(exists=True, empty=True, url=url)
+        return url
+
+
+class ProvisionTests(unittest.TestCase):
+    def test_provision_creates_remote_only_when_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            local = init_repo(tmp / "orphan-app")
+            write_commit(local, "README.md", "hello\n", "initial")
+            app = make_app(tmp, tmp)
+            logger = make_logger(tmp)
+            self.addCleanup(logger.close)
+            api = FakeGithubApi(tmp / "gh")
+            candidate = syncmod.ProvisionCandidate(
+                path=local,
+                name="orphan-app",
+                kind="no_remote",
+                github_name="orphan-app",
+            )
+            result = syncmod.provision_one(candidate, app, api, "test-owner", logger, dry_run=False)
+            self.assertEqual(result.kind, ResultKind.CREATE, result.message)
+            self.assertEqual(api.created, ["orphan-app"])
+            remotes = git(local, "remote", "-v").stdout
+            self.assertIn("origin", remotes)
+            git(local, "fetch", "origin")
+            self.assertTrue(git(local, "rev-parse", "origin/main").stdout.strip())
+
+            again = syncmod.provision_one(candidate, app, api, "test-owner", logger, dry_run=False)
+            self.assertEqual(again.kind, ResultKind.ERROR)
+            self.assertIn("すでに remote", again.message)
+            self.assertEqual(api.created, ["orphan-app"])
+
+    def test_provision_inits_non_git_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            project = tmp / "plain-app"
+            project.mkdir()
+            (project / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            app = make_app(tmp, tmp)
+            logger = make_logger(tmp)
+            self.addCleanup(logger.close)
+            api = FakeGithubApi(tmp / "gh")
+            candidate = syncmod.ProvisionCandidate(
+                path=project,
+                name="plain-app",
+                kind="not_git",
+                github_name="plain-app",
+            )
+            result = syncmod.provision_one(candidate, app, api, "test-owner", logger, dry_run=False)
+            self.assertEqual(result.kind, ResultKind.CREATE, result.message)
+            self.assertTrue((project / ".git").exists())
+            self.assertEqual(api.created, ["plain-app"])
+
+    def test_provision_does_not_attach_non_empty_existing_github(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            local = init_repo(tmp / "taken-app")
+            write_commit(local, "README.md", "hello\n", "initial")
+            app = make_app(tmp, tmp)
+            logger = make_logger(tmp)
+            self.addCleanup(logger.close)
+            api = FakeGithubApi(tmp / "gh")
+            api.existing["taken-app"] = syncmod.GithubRepoInfo(
+                exists=True,
+                empty=False,
+                url="https://github.com/test-owner/taken-app.git",
+            )
+            candidate = syncmod.ProvisionCandidate(
+                path=local,
+                name="taken-app",
+                kind="no_remote",
+                github_name="taken-app",
+            )
+            result = syncmod.provision_one(candidate, app, api, "test-owner", logger, dry_run=False)
+            self.assertEqual(result.kind, ResultKind.ERROR)
+            self.assertIn("空ではありません", result.message)
+            remotes = git(local, "remote", "-v").stdout
+            self.assertNotIn("origin", remotes)
+            self.assertEqual(api.created, [])
+
+    def test_discover_non_git_direct_children_only(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "plain").mkdir()
+            init_repo(root / "already-git")
+            (root / "node_modules").mkdir()
+            found = {p.name for p in syncmod.discover_non_git_projects(root, {"node_modules", ".git"})}
+            self.assertIn("plain", found)
+            self.assertNotIn("already-git", found)
+            self.assertNotIn("node_modules", found)
 
 
 if __name__ == "__main__":

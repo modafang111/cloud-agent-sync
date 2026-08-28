@@ -14,7 +14,7 @@ D:\dev 配下の複数プロジェクト  →  cloud-agent-sync（このツー�
 
 - Cloud Agent が編集するのは、主にこの管理プログラムです。
 - 各アプリの同期は、**そのプロジェクト自身の GitHub リポジトリ** 経由で行います。
-- 既存プロジェクトの `.git` / `remote` / `branch` は変更しません。
+- 既存プロジェクトの `.git` / `remote` / `branch` は、remote が無いプロジェクトを `sync --provision` で新規接続する場合を除き変更しません。
 - `git push --force` / `git reset --hard` / `git clean -fd` / 履歴の強制書き換えは行いません。
 
 日常操作は **`sync` だけ** です。常駐監視・定期実行・起動時自動同期はありません。
@@ -181,6 +181,34 @@ sync --add D:\dev\project-d
 sync --enable project-d
 ```
 
+## GitHub リポジトリが無いプロジェクト
+
+日常の `sync` は、**すでに Git があり、すでに remote があるプロジェクト** だけを同期します。  
+GitHub リポジトリが無いもの、Git 自体が無いフォルダは、次のコマンドで作成して対象に入れます。
+
+```powershell
+sync --provision
+```
+
+確認画面のあと、次を行います。
+
+1. `D:\dev` 直下で Git 未初期化のフォルダを `git init`
+2. Git はあるが remote が無いプロジェクトを検出
+3. GitHub に同名リポジトリが無ければ **新規作成**（既定は private）
+4. 既存の中身がある GitHub リポジトリには接続しない（履歴衝突を避ける）
+5. `git remote add origin` して push
+6. `repositories.json` の同期対象に追加
+
+すでに remote があるプロジェクトは変更しません。
+
+確認を省略する場合:
+
+```powershell
+sync --provision --yes
+```
+
+公開リポジトリにしたい場合は `config.json` の `new_repo_private` を `false` にします。
+
 ## 同期対象から外す方法
 
 登録ごと削除:
@@ -248,6 +276,7 @@ clone 先が違う場合は、その clone 先の `logs` です。
 ```powershell
 sync --scan      # 検出するだけ（設定は変えない）
 sync --list      # 登録済み一覧
+sync --provision # GitHub が無いプロジェクトを新規作成して対象に入れる
 sync --dry-run   # 判定だけ。commit / merge / push しない
 sync --doctor    # Git / Python / D:\dev / PATH を点検
 ```
@@ -277,4 +306,4 @@ Cloud Agent はこのリポジトリのプログラムを編集できます。
 - `git clean -fd`
 - ファイル削除コマンド
 - rebase や commit --amend による履歴の強制書き換え
-- remote / upstream / 現在 branch の変更
+- remote / upstream / 現在 branch の変更（`sync --provision` で remote が無い場合に `origin` を追加する処理を除く）
