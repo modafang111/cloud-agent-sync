@@ -22,6 +22,7 @@ from sync import (  # noqa: E402
     Decision,
     GitClient,
     RepoConfig,
+    RepoResult,
     RepoSnapshot,
     ResultKind,
     SyncLogger,
@@ -241,6 +242,9 @@ class HelperTests(unittest.TestCase):
         self.assertNotIn("powershell", cmd.lower())
         runner = (ROOT / "run-sync-task.cmd").read_text(encoding="utf-8")
         self.assertIn("bin\\sync.cmd", runner)
+        self.assertIn("send-notify-fallback.ps1", runner)
+        fallback = (ROOT / "send-notify-fallback.ps1").read_bytes()
+        self.assertTrue(fallback.startswith(b"\xef\xbb\xbf"), "Windows PowerShell 5.1 needs UTF-8 BOM")
         ps1 = (ROOT / "register-task.ps1").read_bytes()
         self.assertTrue(ps1.startswith(b"\xef\xbb\xbf"), "Windows PowerShell 5.1 needs UTF-8 BOM")
         ps1_text = ps1.decode("utf-8-sig")
@@ -388,6 +392,7 @@ class IntegrationTests(unittest.TestCase):
                 "log_dir": str(tmp / "logs"),
                 "preferred_remote": "origin",
                 "exclude_dir_names": [".git", "node_modules"],
+                "notify_on_sync": False,
             }
             config_path = tmp / "config.json"
             config_path.write_text(json.dumps(cfg), encoding="utf-8")
@@ -673,6 +678,83 @@ class AutoAddTests(unittest.TestCase):
             results = syncmod.auto_enroll_new_projects(app, repos_path, logger, api=FakeGithubApi(tmp / "gh"))
             self.assertEqual(results, [])
             self.assertEqual(syncmod.load_repositories(repos_path), [])
+
+
+class NotifyTests(unittest.TestCase):
+    def test_subject_marks_errors_and_conflicts(self) -> None:
+        results = [
+            RepoResult(kind=ResultKind.SKIP, name="ok-app", path=Path("ok-app"), message="変更なし"),
+            RepoResult(kind=ResultKind.CONFLICT, name="bad", path=Path("bad"), message="双方に変更"),
+            RepoResult(kind=ResultKind.ERROR, name="err", path=Path("err"), message="remote なし"),
+        ]
+        subject = syncmod.format_notify_subject(results)
+        self.assertIn("要確認", subject)
+        self.assertIn("コンフリクト1", subject)
+        self.assertIn("エラー1", subject)
+        body = syncmod.format_notify_body(results, log_path=Path("logs/test.log"), crash="", note="")
+        self.assertIn("[CONFLICT] bad", body)
+        self.assertIn("[ERROR] err", body)
+        self.assertIn("logs/test.log", body)
+        self.assertNotIn("smtp_password", body)
+        start = syncmod.format_notify_subject([], phase="start")
+        self.assertIn("開始", start)
+        crash = syncmod.format_notify_subject([], crash="boom")
+        self.assertIn("失敗", crash)
+
+    def test_send_notification_always_attempts_on_error(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            app = make_app(tmp, tmp)
+            app.notify_on_sync = True
+            app.notify_email = "modafang111@gmail.com"
+            app.smtp_user = "modafang111@gmail.com"
+            app.smtp_password = "not-a-real-password"
+            sent: list[tuple[str, str]] = []
+
+            def fake_send(_app: AppConfig, subject: str, body: str) -> tuple[bool, str]:
+                sent.append((subject, body))
+                return True, ""
+
+            logger = make_logger(tmp)
+            self.addCleanup(logger.close)
+            results = [
+                RepoResult(kind=ResultKind.ERROR, name="broken", path=tmp / "broken", message="boom"),
+            ]
+            ok = syncmod.send_sync_notification(
+                app,
+                results=results,
+                log_path=logger.log_path,
+                phase="end",
+                sender=fake_send,
+                logger=logger,
+            )
+            self.assertTrue(ok)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("要確認", sent[0][0])
+            self.assertIn("[ERROR] broken", sent[0][1])
+
+    def test_local_json_supplies_password(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            (tmp / "config.json").write_text(
+                json.dumps(
+                    {
+                        "root_dir": str(tmp),
+                        "log_dir": str(tmp / "logs"),
+                        "notify_email": "modafang111@gmail.com",
+                        "smtp_user": "modafang111@gmail.com",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (tmp / "notify.local.json").write_text(
+                json.dumps({"smtp_password": "app-pass-word"}),
+                encoding="utf-8",
+            )
+            app = syncmod.load_config(tmp / "config.json")
+            self.assertEqual(app.notify_email, "modafang111@gmail.com")
+            self.assertEqual(app.smtp_password, "app-pass-word")
+            self.assertTrue(syncmod.notify_ready(app))
 
 
 if __name__ == "__main__":

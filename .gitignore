@@ -5,6 +5,7 @@ __pycache__/
 .venv/
 venv/
 repositories.json
+notify.local.json
 .python-version
 
 # --- cloud-agent-sync ---

@@ -282,18 +282,20 @@ clone 先が違う場合は、その clone 先の `logs` です。
 日常は不要です。設定を変えるときだけ使います。
 
 ```powershell
-sync --scan      # 検出するだけ（設定は変えない）
-sync --list      # 登録済み一覧
-sync --provision # GitHub が無いプロジェクトを新規作成して対象に入れる
-sync --dry-run   # 判定だけ。commit / merge / push しない
-sync --doctor    # Git / Python / D:\dev / PATH を点検
+sync --scan         # 検出するだけ（設定は変えない）
+sync --list         # 登録済み一覧
+sync --provision    # GitHub が無いプロジェクトを新規作成して対象に入れる
+sync --dry-run      # 判定だけ。commit / merge / push しない
+sync --doctor       # Git / Python / D:\dev / PATH / 通知メールを点検
+sync --notify-test  # 通知メールの送信テスト（同期はしない）
 ```
 
 設定ファイル:
 
 | ファイル | 用途 |
 |---|---|
-| `config.json` | 同期ルート（既定 `D:\dev`）、深さ、自動 commit、gitignore、新規プロジェクト自動追加など |
+| `config.json` | 同期ルート（既定 `D:\dev`）、深さ、自動 commit、gitignore、新規プロジェクト自動追加、通知メール宛先など |
+| `notify.local.json` | SMTP アプリパスワード。Git 管理しない。`notify.local.example.json` をコピーして作る |
 | `gitignore.template` | 各プロジェクトへ入れる「ソース以外を除外」のひな形 |
 | `repositories.json` | 同期対象。初回 `sync` で生成。Git 管理しない（マシン固有） |
 | `repositories.example.json` | 見本 |
@@ -334,6 +336,39 @@ git pull
 
 タスクが実際に起動するファイルは `run-sync-task.cmd` です。`sync` だけ呼び、`--init` は使いません。
 
+## 通知メール
+
+毎週のタスクでも、手で `sync` したときでも、**開始時と終了時に必ずメール**します。コンフリクトやエラーでも終了メールは送ります。届かないと実行に気づけないためです。
+
+宛先の既定は `modafang111@gmail.com`（`config.json` の `notify_email`）です。Gmail は通常のログインパスワードでは送れません。**アプリパスワード**が必要です。
+
+```powershell
+cd D:\dev\cloud-agent-sync
+git pull
+copy notify.local.example.json notify.local.json
+notepad notify.local.json
+```
+
+1. [Google アカウント](https://myaccount.google.com/apppasswords) で 2 段階認証を有効にする
+2. 「アプリパスワード」を発行する（アプリ名は `cloud-agent-sync` でよい）
+3. `notify.local.json` の `smtp_password` に、発行された 16 文字を貼る
+4. テストする
+
+```powershell
+sync --notify-test
+```
+
+件名の見方:
+
+| 件名 | 意味 |
+|---|---|
+| `同期を開始しました` | タスク／`sync` が動き出した |
+| `同期完了` | 問題なく終わった |
+| `要確認` | コンフリクトまたはエラーあり（本文に詳細） |
+| `同期失敗` | 途中で停止、または Python が無い |
+
+`notify.local.json` は GitHub に上げません。パスワードを `config.json` に書かないでください。
+
 注意:
 
 - 事前に一度 `sync` または `sync --init` 済みであること（初回の番号選択はタスクではできません）
@@ -341,7 +376,7 @@ git pull
 - `D:\dev` に増えたソースプロジェクトは、この `sync` が自動で対象に入れ、必要なら GitHub も作ります
 - `--disable` したプロジェクトは自動では戻しません
 - Windows にログイン中の方が、GitHub 認証が安定します
-- コンフリクトのプロジェクトは、いつもどおりその件だけ止まります
+- コンフリクトのプロジェクトは、いつもどおりその件だけ止まります。結果は通知メールでも届きます
 
 
 ## Cursor Cloud Agent 向け

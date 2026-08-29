@@ -12,19 +12,26 @@ import argparse
 import json
 import os
 import re
+import smtplib
+import socket
+import ssl
 import subprocess
 import sys
+import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
+from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
-from typing import IO, Any, Iterable, Sequence
+from typing import Callable, IO, Any, Iterable, Sequence
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = Path(r"D:\dev")
 REPOS_FILE_NAME = "repositories.json"
 CONFIG_FILE_NAME = "config.json"
 EXAMPLE_REPOS_FILE_NAME = "repositories.example.json"
+NOTIFY_LOCAL_FILE_NAME = "notify.local.json"
+SMTP_PASSWORD_ENV = "CLOUD_AGENT_SYNC_SMTP_PASSWORD"
 
 ALLOWED_GIT_VERBS = frozenset(
     {
@@ -111,6 +118,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auto_add_projects": True,
     "auto_provision_github": True,
     "auto_init_non_git": True,
+    "notify_on_sync": True,
+    "notify_email": "",
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": "",
 }
 
 
@@ -169,6 +182,12 @@ class AppConfig:
     auto_add_projects: bool = True
     auto_provision_github: bool = True
     auto_init_non_git: bool = True
+    notify_on_sync: bool = True
+    notify_email: str = ""
+    smtp_host: str = "smtp.gmail.com"
+    smtp_port: int = 587
+    smtp_user: str = ""
+    smtp_password: str = ""
 
 
 @dataclass
@@ -271,14 +290,17 @@ def git_config_get(key: str, repo: Path | None = None) -> str:
     if repo is not None:
         command.extend(["-C", str(repo)])
     command.extend(["config", "--get", key])
-    completed = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except FileNotFoundError:
+        return ""
     if completed.returncode != 0:
         return ""
     return completed.stdout.strip()
@@ -493,6 +515,16 @@ class SyncLogger:
             self.line(f"{result.name} GIT_STATE {result.git_state}")
 
 
+def _load_json_object(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
 def load_config(path: Path) -> AppConfig:
     raw = dict(DEFAULT_CONFIG)
     if path.is_file():
@@ -504,6 +536,19 @@ def load_config(path: Path) -> AppConfig:
     if not log_dir.is_absolute():
         log_dir = path.parent / log_dir
     exclude = {str(name) for name in raw.get("exclude_dir_names", [])}
+    local_notify = _load_json_object(path.parent / NOTIFY_LOCAL_FILE_NAME)
+    notify_email = str(local_notify.get("notify_email", raw.get("notify_email", ""))).strip()
+    if not notify_email:
+        notify_email = git_config_get("user.email").strip()
+    smtp_host = str(local_notify.get("smtp_host", raw.get("smtp_host", "smtp.gmail.com"))).strip() or "smtp.gmail.com"
+    smtp_port = int(local_notify.get("smtp_port", raw.get("smtp_port", 587)))
+    smtp_user = str(local_notify.get("smtp_user", raw.get("smtp_user", ""))).strip() or notify_email
+    smtp_password = str(
+        os.environ.get(SMTP_PASSWORD_ENV)
+        or local_notify.get("smtp_password")
+        or raw.get("smtp_password")
+        or ""
+    ).strip().replace(" ", "")
     return AppConfig(
         root_dir=Path(str(raw["root_dir"])),
         max_depth=int(raw.get("max_depth", 2)),
@@ -524,6 +569,12 @@ def load_config(path: Path) -> AppConfig:
         auto_add_projects=bool(raw.get("auto_add_projects", True)),
         auto_provision_github=bool(raw.get("auto_provision_github", True)),
         auto_init_non_git=bool(raw.get("auto_init_non_git", True)),
+        notify_on_sync=bool(raw.get("notify_on_sync", True)),
+        notify_email=notify_email,
+        smtp_host=smtp_host,
+        smtp_port=smtp_port,
+        smtp_user=smtp_user,
+        smtp_password=smtp_password,
     )
 
 
@@ -1016,6 +1067,226 @@ def print_summary(results: Sequence[RepoResult]) -> None:
             print(line)
 
 
+@dataclass
+class ResultCounts:
+    success: int = 0
+    skip: int = 0
+    conflict: int = 0
+    network: int = 0
+    error: int = 0
+
+
+def summarize_results(results: Sequence[RepoResult]) -> ResultCounts:
+    return ResultCounts(
+        success=sum(
+            1
+            for r in results
+            if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.ADD, ResultKind.CREATE}
+        ),
+        skip=sum(1 for r in results if r.kind == ResultKind.SKIP),
+        conflict=sum(1 for r in results if r.kind == ResultKind.CONFLICT),
+        network=sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error),
+        error=sum(1 for r in results if r.kind == ResultKind.ERROR and not r.network_error),
+    )
+
+
+def notify_ready(app: AppConfig) -> bool:
+    return bool(
+        app.notify_on_sync
+        and app.notify_email
+        and app.smtp_host
+        and app.smtp_password
+        and app.smtp_user
+    )
+
+
+def notify_setup_hint() -> list[str]:
+    return [
+        "[警告] 通知メールを送れません。Gmail のアプリパスワードが必要です。",
+        f"  1. {SCRIPT_DIR / 'notify.local.example.json'} を notify.local.json にコピー",
+        "  2. Google アカウント → セキュリティ → 2段階認証 → アプリパスワード",
+        "  3. notify.local.json の smtp_password にアプリパスワードを書く",
+        "  4. sync --notify-test で送信テスト",
+    ]
+
+
+def format_notify_subject(
+    results: Sequence[RepoResult],
+    *,
+    crash: str = "",
+    phase: str = "end",
+    note: str = "",
+) -> str:
+    if phase == "start":
+        return "[cloud-agent-sync] 同期を開始しました"
+    if crash:
+        return "[cloud-agent-sync] 同期失敗（途中で停止）"
+    counts = summarize_results(results)
+    if counts.conflict or counts.error or counts.network:
+        parts: list[str] = []
+        if counts.conflict:
+            parts.append(f"コンフリクト{counts.conflict}")
+        if counts.network:
+            parts.append(f"接続エラー{counts.network}")
+        if counts.error:
+            parts.append(f"エラー{counts.error}")
+        return "[cloud-agent-sync] 要確認 " + " ".join(parts)
+    if note and not results:
+        return "[cloud-agent-sync] 同期なし（要確認）"
+    return "[cloud-agent-sync] 同期完了"
+
+
+def format_notify_body(
+    results: Sequence[RepoResult],
+    *,
+    log_path: Path | None = None,
+    crash: str = "",
+    note: str = "",
+    dry_run: bool = False,
+) -> str:
+    when = now_stamp().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = "(unknown)"
+    counts = summarize_results(results)
+    lines = [
+        "cloud-agent-sync の実行結果です。",
+        "",
+        f"日時: {when}",
+        f"ホスト: {host}",
+    ]
+    if dry_run:
+        lines.append("モード: dry-run（commit / merge / push なし）")
+    if log_path:
+        lines.append(f"ログ: {log_path}")
+    lines.append("")
+    lines.append("----- 集計 -----")
+    lines.append(f"同期成功：{counts.success}件")
+    lines.append(f"変更なし：{counts.skip}件")
+    lines.append(f"コンフリクト：{counts.conflict}件")
+    lines.append(f"接続エラー：{counts.network}件")
+    lines.append(f"その他エラー：{counts.error}件")
+    if note:
+        lines.append("")
+        lines.append(note)
+    if crash:
+        lines.append("")
+        lines.append("----- 例外 -----")
+        lines.append(crash.strip())
+    if results:
+        lines.append("")
+        lines.append("----- 詳細 -----")
+        for result in results:
+            line = format_result_line(result)
+            lines.append(line)
+            for extra in result.details[:8]:
+                lines.append(f"        {extra}")
+    lines.append("")
+    lines.append("成功でも失敗でも、毎回このメールを送ります。")
+    return "\n".join(lines) + "\n"
+
+
+def smtp_send(app: AppConfig, subject: str, body: str) -> tuple[bool, str]:
+    if not notify_ready(app):
+        return False, "notify not configured"
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = app.smtp_user
+    msg["To"] = app.notify_email
+    msg.set_content(body)
+    try:
+        if int(app.smtp_port) == 465:
+            with smtplib.SMTP_SSL(app.smtp_host, app.smtp_port, timeout=30) as smtp:
+                smtp.login(app.smtp_user, app.smtp_password)
+                smtp.send_message(msg)
+        else:
+            context = ssl.create_default_context()
+            with smtplib.SMTP(app.smtp_host, app.smtp_port, timeout=30) as smtp:
+                smtp.ehlo()
+                smtp.starttls(context=context)
+                smtp.login(app.smtp_user, app.smtp_password)
+                smtp.send_message(msg)
+        return True, ""
+    except (OSError, smtplib.SMTPException) as exc:
+        text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
+        return False, text
+
+
+def send_sync_notification(
+    app: AppConfig,
+    *,
+    results: Sequence[RepoResult] | None = None,
+    log_path: Path | None = None,
+    crash: str = "",
+    note: str = "",
+    dry_run: bool = False,
+    phase: str = "end",
+    sender: Callable[[AppConfig, str, str], tuple[bool, str]] | None = None,
+    logger: SyncLogger | None = None,
+) -> bool:
+    if not app.notify_on_sync:
+        return False
+    if not notify_ready(app):
+        for line in notify_setup_hint():
+            print(line)
+        if logger:
+            logger.line("NOTIFY skipped (password or address missing)")
+        return False
+    payload = list(results or [])
+    subject = format_notify_subject(payload, crash=crash, phase=phase, note=note)
+    if phase == "start":
+        body_lines = [
+            "cloud-agent-sync が同期を開始しました。",
+            "",
+            f"日時: {now_stamp().strftime('%Y-%m-%d %H:%M:%S')}",
+        ]
+        if log_path:
+            body_lines.append(f"ログ: {log_path}")
+        body_lines.append("")
+        body_lines.append("終了時にもう一通、結果メールを送ります。エラーでも必ず送ります。")
+        body = "\n".join(body_lines) + "\n"
+    else:
+        body = format_notify_body(
+            payload, log_path=log_path, crash=crash, note=note, dry_run=dry_run
+        )
+    send = sender or smtp_send
+    ok, err = send(app, subject, body)
+    if ok:
+        print(f"通知メールを送信しました: {app.notify_email}  ({subject})")
+        if logger:
+            logger.line(f"NOTIFY sent to={app.notify_email} subject={subject}")
+        return True
+    print(f"通知メールの送信に失敗しました: {err}")
+    if logger:
+        logger.line(f"NOTIFY failed {err}")
+    return False
+
+
+def cmd_notify_test(app: AppConfig, logger: SyncLogger | None = None) -> int:
+    print_banner()
+    print("通知メールの送信テストです。同期はしません。")
+    print(f"宛先: {app.notify_email or '(未設定)'}")
+    print(f"SMTP: {app.smtp_host}:{app.smtp_port}  user={app.smtp_user or '(未設定)'}")
+    print(f"パスワード: {'設定済み' if app.smtp_password else '未設定'}")
+    if not notify_ready(app):
+        for line in notify_setup_hint():
+            print(line)
+        return 1
+    fake = [
+        RepoResult(kind=ResultKind.SKIP, name="sample-ok", path=Path("sample-ok"), message="テスト: 変更なし"),
+        RepoResult(kind=ResultKind.ERROR, name="sample-error", path=Path("sample-error"), message="テスト: エラーでも届く"),
+    ]
+    ok = send_sync_notification(
+        app,
+        results=fake,
+        log_path=logger.log_path if logger else None,
+        note="これは sync --notify-test のテストメールです。",
+        logger=logger,
+    )
+    return 0 if ok else 1
+
+
 def stdin_is_tty() -> bool:
     try:
         return sys.stdin.isatty()
@@ -1184,6 +1455,14 @@ def cmd_doctor(app: AppConfig, repos_path: Path) -> int:
             print('         git config --global user.name "Your Name"')
             print('         git config --global user.email "you@example.com"')
         print("  GitHub リポジトリ未作成のプロジェクトは、日常の sync で自動作成します（config でオフにできます）")
+
+    print(f"  通知メール: {'ON' if app.notify_on_sync else 'OFF'}")
+    print(f"  通知宛先: {app.notify_email or '(未設定)'}")
+    print(f"  SMTP: {app.smtp_host}:{app.smtp_port}  user={app.smtp_user or '(未設定)'}")
+    print(f"  SMTP パスワード: {'設定済み' if app.smtp_password else '未設定（notify.local.json）'}")
+    if app.notify_on_sync and not notify_ready(app):
+        for line in notify_setup_hint():
+            print("  " + line)
 
     if is_windows():
         user_path = os.environ.get("PATH", "")
@@ -2009,7 +2288,7 @@ def run_sync(
     logger: SyncLogger,
     *,
     dry_run: bool,
-) -> int:
+) -> tuple[int, list[RepoResult]]:
     enabled = [repo for repo in repos if repo.enabled]
     disabled = [repo for repo in repos if not repo.enabled]
     print_banner()
@@ -2019,7 +2298,7 @@ def run_sync(
     print()
     if not enabled:
         print("同期対象がありません。sync --init または repositories.json を編集してください。")
-        return 0
+        return 0, []
 
     results: list[RepoResult] = []
     for repo in enabled:
@@ -2033,15 +2312,16 @@ def run_sync(
         print()
 
     print_summary(results)
+    counts = summarize_results(results)
     logger.line(
         "SUMMARY "
         + ", ".join(
             [
-                f"ok={sum(1 for r in results if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.ADD, ResultKind.CREATE})}",
-                f"skip={sum(1 for r in results if r.kind == ResultKind.SKIP)}",
-                f"conflict={sum(1 for r in results if r.kind == ResultKind.CONFLICT)}",
-                f"network={sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error)}",
-                f"error={sum(1 for r in results if r.kind == ResultKind.ERROR and not r.network_error)}",
+                f"ok={counts.success}",
+                f"skip={counts.skip}",
+                f"conflict={counts.conflict}",
+                f"network={counts.network}",
+                f"error={counts.error}",
             ]
         )
     )
@@ -2049,8 +2329,8 @@ def run_sync(
     print()
     print(f"ログ: {logger.log_path}")
     if any(r.kind in {ResultKind.CONFLICT, ResultKind.ERROR} for r in results):
-        return 2
-    return 0
+        return 2, results
+    return 0, results
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2069,6 +2349,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--yes", action="store_true", help="確認質問を省略する（--provision 用）")
     parser.add_argument("--dry-run", action="store_true", help="判定のみ。commit/merge/push しない")
     parser.add_argument("--doctor", action="store_true", help="Git / 設定 / ルートディレクトリを点検")
+    parser.add_argument("--notify-test", action="store_true", help="通知メールだけ送って同期はしない")
     parser.add_argument("--config", default=str(SCRIPT_DIR / CONFIG_FILE_NAME), help="config.json のパス")
     return parser
 
@@ -2086,10 +2367,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     repos_path = config_path.parent / REPOS_FILE_NAME
     log_name = now_stamp().strftime("sync-%Y%m%d-%H%M%S.log")
     logger = SyncLogger(app.log_dir / log_name)
+    notify = {
+        "wanted": False,
+        "results": [],
+        "crash": "",
+        "note": "",
+        "code": 0,
+    }
     try:
         logger.line(f"argv={list(argv if argv is not None else sys.argv[1:])}")
         logger.line(f"root_dir={app.root_dir}")
         logger.line(f"config={config_path}")
+
+        if args.notify_test:
+            return cmd_notify_test(app, logger)
 
         if args.doctor:
             return cmd_doctor(app, repos_path)
@@ -2136,11 +2427,24 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dry_run=bool(args.dry_run),
             )
 
+        notify["wanted"] = True
         setup = ensure_repos_configured(app, repos_path, logger, force_init=bool(args.init))
         if setup is None:
+            notify["note"] = "同期ルートが無いか、初期化に失敗しました。"
+            notify["code"] = 1
             return 1
         if not setup.run_sync:
+            notify["note"] = "同期は実行しませんでした（初回の選択待ち、または有効な対象がありません）。"
             return 0
+
+        send_sync_notification(
+            app,
+            log_path=logger.log_path,
+            phase="start",
+            logger=logger,
+        )
+
+        enroll_results: list[RepoResult] = []
         enroll_failed = False
         repos = list(setup.repos)
         if not args.init:
@@ -2152,11 +2456,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             enroll_failed = any(r.kind == ResultKind.ERROR for r in enroll_results)
             repos = load_repositories(repos_path) or repos
-        code = run_sync(app, repos, logger, dry_run=bool(args.dry_run))
+        code, results = run_sync(app, repos, logger, dry_run=bool(args.dry_run))
+        notify["results"] = list(enroll_results) + list(results)
         if enroll_failed and code == 0:
-            return 2
+            code = 2
+        notify["code"] = code
         return code
+    except Exception:
+        notify["wanted"] = True
+        notify["crash"] = traceback.format_exc()
+        logger.line("UNCAUGHT\n" + notify["crash"])
+        eprint("同期中に予期しないエラーが起きました。通知メールで結果を送ります。")
+        eprint(notify["crash"])
+        notify["code"] = 1
+        return 1
     finally:
+        if notify["wanted"]:
+            try:
+                send_sync_notification(
+                    app,
+                    results=notify["results"],
+                    log_path=logger.log_path,
+                    crash=str(notify["crash"] or ""),
+                    note=str(notify["note"] or ""),
+                    dry_run=bool(args.dry_run),
+                    phase="end",
+                    logger=logger,
+                )
+            except Exception as exc:
+                eprint(f"通知メール処理で失敗しました: {exc}")
+                logger.line(f"NOTIFY crashed {exc}")
         logger.close()
 
 
