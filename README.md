@@ -367,7 +367,33 @@ sync --notify-test
 | `要確認` | コンフリクトまたはエラーあり（本文に詳細） |
 | `同期失敗` | 途中で停止、または Python が無い |
 
-`notify.local.json` は GitHub に上げません。パスワードを `config.json` に書かないでください。
+`notify.local.json` は GitHub に上げません。パスワードを `config.json` に書かないでください。各プロジェクトにもコピーしません。
+
+### 他の Python プロジェクトから使う
+
+パスワードは `D:\dev\cloud-agent-sync\notify.local.json` の1つだけです。最初の接続先は稼働中の `line-stamp-auto` です。
+
+```python
+import sys
+sys.path.insert(0, r"D:\dev\cloud-agent-sync")
+import notify as notify_mail
+
+notify_mail.notify_job("line-stamp-auto", "start")
+try:
+    # いつもの処理
+    notify_mail.notify_job("line-stamp-auto", "end", note="完了")
+except Exception:
+    import traceback
+    notify_mail.notify_job("line-stamp-auto", "end", crash=traceback.format_exc())
+    raise
+```
+
+またはバッチから:
+
+```powershell
+py -3 D:\dev\cloud-agent-sync\notify.py --event start --project line-stamp-auto
+py -3 D:\dev\cloud-agent-sync\notify.py --event end --project line-stamp-auto --note "完了"
+```
 
 注意:
 

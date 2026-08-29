@@ -723,6 +723,51 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("送信テスト", test_msg.subject)
         self.assertIn("[ERROR] sample", test_msg.body)
 
+    def test_notify_job_reads_home_password_and_names_project(self) -> None:
+        import notify as notify_mail
+
+        sent: list[tuple[str, str]] = []
+
+        def fake_send(_settings: notify_mail.NotifySettings, subject: str, body: str) -> tuple[bool, str]:
+            sent.append((subject, body))
+            return True, ""
+
+        ok = notify_mail.notify_job(
+            "line-stamp-auto",
+            notify_mail.NotifyEvent.START,
+            note="開始",
+            sender=fake_send,
+            settings=notify_mail.NotifySettings(
+                enabled=True,
+                to_email="modafang111@gmail.com",
+                smtp_host="smtp.gmail.com",
+                smtp_port=587,
+                smtp_user="modafang111@gmail.com",
+                smtp_password="secret",
+            ),
+        )
+        self.assertTrue(ok)
+        self.assertIn("line-stamp-auto を開始しました", sent[0][0])
+        self.assertIn("line-stamp-auto", sent[0][1])
+        self.assertNotIn("smtp_password", sent[0][1])
+        done = notify_mail.notify_job(
+            "line-stamp-auto",
+            notify_mail.NotifyEvent.END,
+            crash="boom",
+            sender=fake_send,
+            settings=notify_mail.NotifySettings(
+                enabled=True,
+                to_email="modafang111@gmail.com",
+                smtp_host="smtp.gmail.com",
+                smtp_port=587,
+                smtp_user="modafang111@gmail.com",
+                smtp_password="secret",
+            ),
+        )
+        self.assertTrue(done)
+        self.assertIn("line-stamp-auto 失敗", sent[1][0])
+        self.assertIn("boom", sent[1][1])
+
     def test_send_goes_through_common_function(self) -> None:
         import notify as notify_mail
 

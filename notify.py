@@ -162,15 +162,20 @@ def format_subject(
     counts: NotifyCounts | None = None,
     crash: str = "",
     note: str = "",
+    project: str = "",
 ) -> str:
     kind = NotifyEvent(event)
     if kind is NotifyEvent.START:
+        if project.strip():
+            return f"{SUBJECT_PREFIX} {project.strip()} を開始しました"
         return f"{SUBJECT_PREFIX} 同期を開始しました"
     if kind is NotifyEvent.PYTHON_MISSING:
         return f"{SUBJECT_PREFIX} 同期失敗（Python なし）"
     if kind is NotifyEvent.TEST:
         return f"{SUBJECT_PREFIX} 送信テスト"
     if crash:
+        if project.strip():
+            return f"{SUBJECT_PREFIX} {project.strip()} 失敗（途中で停止）"
         return f"{SUBJECT_PREFIX} 同期失敗（途中で停止）"
     stats = counts or NotifyCounts()
     if stats.conflict or stats.error or stats.network:
@@ -181,9 +186,14 @@ def format_subject(
             parts.append(f"接続エラー{stats.network}")
         if stats.error:
             parts.append(f"エラー{stats.error}")
-        return f"{SUBJECT_PREFIX} 要確認 " + " ".join(parts)
+        head = f"{SUBJECT_PREFIX} {project.strip()} 要確認" if project.strip() else f"{SUBJECT_PREFIX} 要確認"
+        return head + " " + " ".join(parts)
     if note and stats.success == 0 and stats.skip == 0:
+        if project.strip():
+            return f"{SUBJECT_PREFIX} {project.strip()} 実行なし（要確認）"
         return f"{SUBJECT_PREFIX} 同期なし（要確認）"
+    if project.strip():
+        return f"{SUBJECT_PREFIX} {project.strip()} 完了"
     return f"{SUBJECT_PREFIX} 同期完了"
 
 
@@ -197,16 +207,19 @@ def format_body(
     note: str = "",
     dry_run: bool = False,
     when: datetime | None = None,
+    project: str = "",
 ) -> str:
     kind = NotifyEvent(event)
     stamp = _now_text(when)
     host = _host_name()
+    name = project.strip() or "cloud-agent-sync"
     if kind is NotifyEvent.START:
         lines = [
-            "cloud-agent-sync が同期を開始しました。",
+            f"{name} を開始しました。" if project.strip() else "cloud-agent-sync が同期を開始しました。",
             "",
             f"日時: {stamp}",
             f"ホスト: {host}",
+            f"プロジェクト: {name}",
         ]
         if log_path:
             lines.append(f"ログ: {log_path}")
@@ -228,10 +241,11 @@ def format_body(
 
     stats = counts or NotifyCounts()
     lines = [
-        "cloud-agent-sync の実行結果です。",
+        f"{name} の実行結果です。" if project.strip() else "cloud-agent-sync の実行結果です。",
         "",
         f"日時: {stamp}",
         f"ホスト: {host}",
+        f"プロジェクト: {name}",
     ]
     if kind is NotifyEvent.TEST:
         lines.append("モード: 送信テスト（同期はしていません）")
@@ -272,9 +286,10 @@ def build_message(
     note: str = "",
     dry_run: bool = False,
     when: datetime | None = None,
+    project: str = "",
 ) -> NotifyMessage:
     return NotifyMessage(
-        subject=format_subject(event, counts=counts, crash=crash, note=note),
+        subject=format_subject(event, counts=counts, crash=crash, note=note, project=project),
         body=format_body(
             event,
             counts=counts,
@@ -284,6 +299,7 @@ def build_message(
             note=note,
             dry_run=dry_run,
             when=when,
+            project=project,
         ),
     )
 
@@ -326,6 +342,7 @@ def send(
     dry_run: bool = False,
     sender: MailSender | None = None,
     log_line: Callable[[str], None] | None = None,
+    project: str = "",
 ) -> bool:
     """開始・終了・テスト・起動失敗のすべてが使う送信入口。"""
     if not settings.enabled:
@@ -344,6 +361,7 @@ def send(
         crash=crash,
         note=note,
         dry_run=dry_run,
+        project=project,
     )
     ok, err = (sender or smtp_send)(settings, message.subject, message.body)
     if ok:
@@ -357,6 +375,36 @@ def send(
     return False
 
 
+def home_settings() -> NotifySettings:
+    """パスワードは cloud-agent-sync の notify.local.json だけを読む。呼び元プロジェクトには置かない。"""
+    return load_settings(SCRIPT_DIR / CONFIG_FILE_NAME)
+
+
+def notify_job(
+    project: str,
+    event: NotifyEvent | str = NotifyEvent.END,
+    *,
+    note: str = "",
+    crash: str = "",
+    details: Sequence[str] | None = None,
+    log_path: Path | str | None = None,
+    sender: MailSender | None = None,
+    settings: NotifySettings | None = None,
+) -> bool:
+    """他の Python プロジェクト用。設定・パスワードは常にこの notify.py の置き場所を使う。"""
+    name = (project or "").strip() or "project"
+    return send(
+        settings or home_settings(),
+        event,
+        note=note,
+        crash=crash,
+        details=details,
+        log_path=log_path,
+        sender=sender,
+        project=name,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="cloud-agent-sync の通知メールを送る")
     parser.add_argument(
@@ -366,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="start / end / test / python_missing",
     )
     parser.add_argument("--note", default="", help="本文に足すメモ")
+    parser.add_argument("--project", default="", help="他プロジェクト名（例: line-stamp-auto）。空なら Git 同期メール")
     parser.add_argument("--log", default="", help="ログファイルのパス")
     parser.add_argument("--config", default=str(SCRIPT_DIR / CONFIG_FILE_NAME))
     return parser
@@ -373,6 +422,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.project:
+        ok = notify_job(
+            args.project,
+            args.event,
+            note=args.note,
+            log_path=args.log or None,
+        )
+        return 0 if ok else 1
     settings = load_settings(Path(args.config))
     ok = send(
         settings,
