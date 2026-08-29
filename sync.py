@@ -12,26 +12,23 @@ import argparse
 import json
 import os
 import re
-import smtplib
-import socket
-import ssl
 import subprocess
 import sys
 import traceback
 from dataclasses import dataclass, field
 from datetime import datetime
-from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
 from typing import Callable, IO, Any, Iterable, Sequence
+
+import notify as notify_mail
+from notify import NotifyCounts, NotifyEvent, NotifySettings
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_ROOT = Path(r"D:\dev")
 REPOS_FILE_NAME = "repositories.json"
 CONFIG_FILE_NAME = "config.json"
 EXAMPLE_REPOS_FILE_NAME = "repositories.example.json"
-NOTIFY_LOCAL_FILE_NAME = "notify.local.json"
-SMTP_PASSWORD_ENV = "CLOUD_AGENT_SYNC_SMTP_PASSWORD"
 
 ALLOWED_GIT_VERBS = frozenset(
     {
@@ -515,16 +512,6 @@ class SyncLogger:
             self.line(f"{result.name} GIT_STATE {result.git_state}")
 
 
-def _load_json_object(path: Path) -> dict[str, Any]:
-    if not path.is_file():
-        return {}
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
-
-
 def load_config(path: Path) -> AppConfig:
     raw = dict(DEFAULT_CONFIG)
     if path.is_file():
@@ -536,19 +523,7 @@ def load_config(path: Path) -> AppConfig:
     if not log_dir.is_absolute():
         log_dir = path.parent / log_dir
     exclude = {str(name) for name in raw.get("exclude_dir_names", [])}
-    local_notify = _load_json_object(path.parent / NOTIFY_LOCAL_FILE_NAME)
-    notify_email = str(local_notify.get("notify_email", raw.get("notify_email", ""))).strip()
-    if not notify_email:
-        notify_email = git_config_get("user.email").strip()
-    smtp_host = str(local_notify.get("smtp_host", raw.get("smtp_host", "smtp.gmail.com"))).strip() or "smtp.gmail.com"
-    smtp_port = int(local_notify.get("smtp_port", raw.get("smtp_port", 587)))
-    smtp_user = str(local_notify.get("smtp_user", raw.get("smtp_user", ""))).strip() or notify_email
-    smtp_password = str(
-        os.environ.get(SMTP_PASSWORD_ENV)
-        or local_notify.get("smtp_password")
-        or raw.get("smtp_password")
-        or ""
-    ).strip().replace(" ", "")
+    ns = notify_mail.load_settings(path)
     return AppConfig(
         root_dir=Path(str(raw["root_dir"])),
         max_depth=int(raw.get("max_depth", 2)),
@@ -569,12 +544,12 @@ def load_config(path: Path) -> AppConfig:
         auto_add_projects=bool(raw.get("auto_add_projects", True)),
         auto_provision_github=bool(raw.get("auto_provision_github", True)),
         auto_init_non_git=bool(raw.get("auto_init_non_git", True)),
-        notify_on_sync=bool(raw.get("notify_on_sync", True)),
-        notify_email=notify_email,
-        smtp_host=smtp_host,
-        smtp_port=smtp_port,
-        smtp_user=smtp_user,
-        smtp_password=smtp_password,
+        notify_on_sync=ns.enabled,
+        notify_email=ns.to_email,
+        smtp_host=ns.smtp_host,
+        smtp_port=ns.smtp_port,
+        smtp_user=ns.smtp_user,
+        smtp_password=ns.smtp_password,
     )
 
 
@@ -1045,39 +1020,25 @@ def print_result(result: RepoResult) -> None:
 
 
 def print_summary(results: Sequence[RepoResult]) -> None:
-    success = sum(
-        1
-        for r in results
-        if r.kind in {ResultKind.OK, ResultKind.PULL, ResultKind.PUSH, ResultKind.ADD, ResultKind.CREATE}
-    )
-    skip = sum(1 for r in results if r.kind == ResultKind.SKIP)
-    conflict = sum(1 for r in results if r.kind == ResultKind.CONFLICT)
-    network = sum(1 for r in results if r.kind == ResultKind.ERROR and r.network_error)
-    other = sum(1 for r in results if r.kind == ResultKind.ERROR and not r.network_error)
+    counts = summarize_results(results)
     print()
     print("----- 集計 -----")
-    print(f"同期成功：{success}件")
-    print(f"変更なし：{skip}件")
-    print(f"コンフリクト：{conflict}件")
-    print(f"接続エラー：{network}件")
-    print(f"その他エラー：{other}件")
+    print(f"同期成功：{counts.success}件")
+    print(f"変更なし：{counts.skip}件")
+    print(f"コンフリクト：{counts.conflict}件")
+    print(f"接続エラー：{counts.network}件")
+    print(f"その他エラー：{counts.error}件")
     if any(r.identity_error for r in results):
         print()
         for line in IDENTITY_HINT_LINES:
             print(line)
 
 
-@dataclass
-class ResultCounts:
-    success: int = 0
-    skip: int = 0
-    conflict: int = 0
-    network: int = 0
-    error: int = 0
+ResultCounts = NotifyCounts
 
 
-def summarize_results(results: Sequence[RepoResult]) -> ResultCounts:
-    return ResultCounts(
+def summarize_results(results: Sequence[RepoResult]) -> NotifyCounts:
+    return NotifyCounts(
         success=sum(
             1
             for r in results
@@ -1090,24 +1051,32 @@ def summarize_results(results: Sequence[RepoResult]) -> ResultCounts:
     )
 
 
-def notify_ready(app: AppConfig) -> bool:
-    return bool(
-        app.notify_on_sync
-        and app.notify_email
-        and app.smtp_host
-        and app.smtp_password
-        and app.smtp_user
+def notify_settings_from_app(app: AppConfig) -> NotifySettings:
+    return NotifySettings(
+        enabled=app.notify_on_sync,
+        to_email=app.notify_email,
+        smtp_host=app.smtp_host,
+        smtp_port=app.smtp_port,
+        smtp_user=app.smtp_user,
+        smtp_password=app.smtp_password,
     )
 
 
+def notify_ready(app: AppConfig) -> bool:
+    return notify_settings_from_app(app).ready()
+
+
 def notify_setup_hint() -> list[str]:
-    return [
-        "[警告] 通知メールを送れません。Gmail のアプリパスワードが必要です。",
-        f"  1. {SCRIPT_DIR / 'notify.local.example.json'} を notify.local.json にコピー",
-        "  2. Google アカウント → セキュリティ → 2段階認証 → アプリパスワード",
-        "  3. notify.local.json の smtp_password にアプリパスワードを書く",
-        "  4. sync --notify-test で送信テスト",
-    ]
+    return notify_mail.notify_setup_hint(SCRIPT_DIR)
+
+
+def result_notify_details(results: Sequence[RepoResult]) -> list[str]:
+    lines: list[str] = []
+    for result in results:
+        lines.append(format_result_line(result))
+        for extra in result.details[:8]:
+            lines.append(f"        {extra}")
+    return lines
 
 
 def format_notify_subject(
@@ -1117,23 +1086,13 @@ def format_notify_subject(
     phase: str = "end",
     note: str = "",
 ) -> str:
-    if phase == "start":
-        return "[cloud-agent-sync] 同期を開始しました"
-    if crash:
-        return "[cloud-agent-sync] 同期失敗（途中で停止）"
-    counts = summarize_results(results)
-    if counts.conflict or counts.error or counts.network:
-        parts: list[str] = []
-        if counts.conflict:
-            parts.append(f"コンフリクト{counts.conflict}")
-        if counts.network:
-            parts.append(f"接続エラー{counts.network}")
-        if counts.error:
-            parts.append(f"エラー{counts.error}")
-        return "[cloud-agent-sync] 要確認 " + " ".join(parts)
-    if note and not results:
-        return "[cloud-agent-sync] 同期なし（要確認）"
-    return "[cloud-agent-sync] 同期完了"
+    event = NotifyEvent.START if phase == "start" else NotifyEvent.END
+    return notify_mail.format_subject(
+        event,
+        counts=summarize_results(results),
+        crash=crash,
+        note=note,
+    )
 
 
 def format_notify_body(
@@ -1144,73 +1103,15 @@ def format_notify_body(
     note: str = "",
     dry_run: bool = False,
 ) -> str:
-    when = now_stamp().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        host = socket.gethostname()
-    except OSError:
-        host = "(unknown)"
-    counts = summarize_results(results)
-    lines = [
-        "cloud-agent-sync の実行結果です。",
-        "",
-        f"日時: {when}",
-        f"ホスト: {host}",
-    ]
-    if dry_run:
-        lines.append("モード: dry-run（commit / merge / push なし）")
-    if log_path:
-        lines.append(f"ログ: {log_path}")
-    lines.append("")
-    lines.append("----- 集計 -----")
-    lines.append(f"同期成功：{counts.success}件")
-    lines.append(f"変更なし：{counts.skip}件")
-    lines.append(f"コンフリクト：{counts.conflict}件")
-    lines.append(f"接続エラー：{counts.network}件")
-    lines.append(f"その他エラー：{counts.error}件")
-    if note:
-        lines.append("")
-        lines.append(note)
-    if crash:
-        lines.append("")
-        lines.append("----- 例外 -----")
-        lines.append(crash.strip())
-    if results:
-        lines.append("")
-        lines.append("----- 詳細 -----")
-        for result in results:
-            line = format_result_line(result)
-            lines.append(line)
-            for extra in result.details[:8]:
-                lines.append(f"        {extra}")
-    lines.append("")
-    lines.append("成功でも失敗でも、毎回このメールを送ります。")
-    return "\n".join(lines) + "\n"
-
-
-def smtp_send(app: AppConfig, subject: str, body: str) -> tuple[bool, str]:
-    if not notify_ready(app):
-        return False, "notify not configured"
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = app.smtp_user
-    msg["To"] = app.notify_email
-    msg.set_content(body)
-    try:
-        if int(app.smtp_port) == 465:
-            with smtplib.SMTP_SSL(app.smtp_host, app.smtp_port, timeout=30) as smtp:
-                smtp.login(app.smtp_user, app.smtp_password)
-                smtp.send_message(msg)
-        else:
-            context = ssl.create_default_context()
-            with smtplib.SMTP(app.smtp_host, app.smtp_port, timeout=30) as smtp:
-                smtp.ehlo()
-                smtp.starttls(context=context)
-                smtp.login(app.smtp_user, app.smtp_password)
-                smtp.send_message(msg)
-        return True, ""
-    except (OSError, smtplib.SMTPException) as exc:
-        text = str(exc).splitlines()[0] if str(exc) else exc.__class__.__name__
-        return False, text
+    return notify_mail.format_body(
+        NotifyEvent.END,
+        counts=summarize_results(results),
+        details=result_notify_details(results),
+        log_path=log_path,
+        crash=crash,
+        note=note,
+        dry_run=dry_run,
+    )
 
 
 def send_sync_notification(
@@ -1222,45 +1123,23 @@ def send_sync_notification(
     note: str = "",
     dry_run: bool = False,
     phase: str = "end",
-    sender: Callable[[AppConfig, str, str], tuple[bool, str]] | None = None,
+    sender: Callable[[NotifySettings, str, str], tuple[bool, str]] | None = None,
     logger: SyncLogger | None = None,
 ) -> bool:
-    if not app.notify_on_sync:
-        return False
-    if not notify_ready(app):
-        for line in notify_setup_hint():
-            print(line)
-        if logger:
-            logger.line("NOTIFY skipped (password or address missing)")
-        return False
     payload = list(results or [])
-    subject = format_notify_subject(payload, crash=crash, phase=phase, note=note)
-    if phase == "start":
-        body_lines = [
-            "cloud-agent-sync が同期を開始しました。",
-            "",
-            f"日時: {now_stamp().strftime('%Y-%m-%d %H:%M:%S')}",
-        ]
-        if log_path:
-            body_lines.append(f"ログ: {log_path}")
-        body_lines.append("")
-        body_lines.append("終了時にもう一通、結果メールを送ります。エラーでも必ず送ります。")
-        body = "\n".join(body_lines) + "\n"
-    else:
-        body = format_notify_body(
-            payload, log_path=log_path, crash=crash, note=note, dry_run=dry_run
-        )
-    send = sender or smtp_send
-    ok, err = send(app, subject, body)
-    if ok:
-        print(f"通知メールを送信しました: {app.notify_email}  ({subject})")
-        if logger:
-            logger.line(f"NOTIFY sent to={app.notify_email} subject={subject}")
-        return True
-    print(f"通知メールの送信に失敗しました: {err}")
-    if logger:
-        logger.line(f"NOTIFY failed {err}")
-    return False
+    event = NotifyEvent.START if phase == "start" else NotifyEvent.END
+    return notify_mail.send(
+        notify_settings_from_app(app),
+        event,
+        counts=summarize_results(payload),
+        details=result_notify_details(payload),
+        log_path=log_path,
+        crash=crash,
+        note=note,
+        dry_run=dry_run,
+        sender=sender,
+        log_line=(logger.line if logger else None),
+    )
 
 
 def cmd_notify_test(app: AppConfig, logger: SyncLogger | None = None) -> int:
@@ -1269,7 +1148,8 @@ def cmd_notify_test(app: AppConfig, logger: SyncLogger | None = None) -> int:
     print(f"宛先: {app.notify_email or '(未設定)'}")
     print(f"SMTP: {app.smtp_host}:{app.smtp_port}  user={app.smtp_user or '(未設定)'}")
     print(f"パスワード: {'設定済み' if app.smtp_password else '未設定'}")
-    if not notify_ready(app):
+    settings = notify_settings_from_app(app)
+    if not settings.ready():
         for line in notify_setup_hint():
             print(line)
         return 1
@@ -1277,12 +1157,14 @@ def cmd_notify_test(app: AppConfig, logger: SyncLogger | None = None) -> int:
         RepoResult(kind=ResultKind.SKIP, name="sample-ok", path=Path("sample-ok"), message="テスト: 変更なし"),
         RepoResult(kind=ResultKind.ERROR, name="sample-error", path=Path("sample-error"), message="テスト: エラーでも届く"),
     ]
-    ok = send_sync_notification(
-        app,
-        results=fake,
+    ok = notify_mail.send(
+        settings,
+        NotifyEvent.TEST,
+        counts=summarize_results(fake),
+        details=result_notify_details(fake),
         log_path=logger.log_path if logger else None,
         note="これは sync --notify-test のテストメールです。",
-        logger=logger,
+        log_line=(logger.line if logger else None),
     )
     return 0 if ok else 1
 

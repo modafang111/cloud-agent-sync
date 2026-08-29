@@ -242,9 +242,10 @@ class HelperTests(unittest.TestCase):
         self.assertNotIn("powershell", cmd.lower())
         runner = (ROOT / "run-sync-task.cmd").read_text(encoding="utf-8")
         self.assertIn("bin\\sync.cmd", runner)
-        self.assertIn("send-notify-fallback.ps1", runner)
-        fallback = (ROOT / "send-notify-fallback.ps1").read_bytes()
-        self.assertTrue(fallback.startswith(b"\xef\xbb\xbf"), "Windows PowerShell 5.1 needs UTF-8 BOM")
+        self.assertIn("notify.cmd", runner)
+        self.assertIn("python_missing", runner)
+        self.assertTrue((ROOT / "notify.py").is_file())
+        self.assertTrue((ROOT / "notify.cmd").is_file())
         ps1 = (ROOT / "register-task.ps1").read_bytes()
         self.assertTrue(ps1.startswith(b"\xef\xbb\xbf"), "Windows PowerShell 5.1 needs UTF-8 BOM")
         ps1_text = ps1.decode("utf-8-sig")
@@ -701,6 +702,54 @@ class NotifyTests(unittest.TestCase):
         crash = syncmod.format_notify_subject([], crash="boom")
         self.assertIn("失敗", crash)
 
+    def test_shared_notify_builder_covers_all_events(self) -> None:
+        import notify as notify_mail
+
+        start = notify_mail.build_message(notify_mail.NotifyEvent.START, log_path="logs/x.log")
+        self.assertIn("開始", start.subject)
+        self.assertIn("logs/x.log", start.body)
+        missing = notify_mail.build_message(
+            notify_mail.NotifyEvent.PYTHON_MISSING,
+            note="Python 3 was not found on PATH.",
+        )
+        self.assertIn("Python なし", missing.subject)
+        self.assertIn("Python 3 was not found", missing.body)
+        test_msg = notify_mail.build_message(
+            notify_mail.NotifyEvent.TEST,
+            counts=notify_mail.NotifyCounts(error=1),
+            details=["[ERROR] sample"],
+            note="テスト",
+        )
+        self.assertIn("送信テスト", test_msg.subject)
+        self.assertIn("[ERROR] sample", test_msg.body)
+
+    def test_send_goes_through_common_function(self) -> None:
+        import notify as notify_mail
+
+        sent: list[tuple[str, str]] = []
+
+        def fake_send(_settings: notify_mail.NotifySettings, subject: str, body: str) -> tuple[bool, str]:
+            sent.append((subject, body))
+            return True, ""
+
+        settings = notify_mail.NotifySettings(
+            enabled=True,
+            to_email="modafang111@gmail.com",
+            smtp_host="smtp.gmail.com",
+            smtp_port=587,
+            smtp_user="modafang111@gmail.com",
+            smtp_password="secret",
+        )
+        for event in (
+            notify_mail.NotifyEvent.START,
+            notify_mail.NotifyEvent.END,
+            notify_mail.NotifyEvent.PYTHON_MISSING,
+        ):
+            ok = notify_mail.send(settings, event, sender=fake_send, note="x")
+            self.assertTrue(ok)
+        self.assertEqual(len(sent), 3)
+        self.assertTrue(all(item[0].startswith("[cloud-agent-sync]") for item in sent))
+
     def test_send_notification_always_attempts_on_error(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             tmp = Path(raw)
@@ -711,7 +760,7 @@ class NotifyTests(unittest.TestCase):
             app.smtp_password = "not-a-real-password"
             sent: list[tuple[str, str]] = []
 
-            def fake_send(_app: AppConfig, subject: str, body: str) -> tuple[bool, str]:
+            def fake_send(_settings: object, subject: str, body: str) -> tuple[bool, str]:
                 sent.append((subject, body))
                 return True, ""
 
