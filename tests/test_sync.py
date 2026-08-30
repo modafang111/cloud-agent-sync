@@ -723,6 +723,56 @@ class NotifyTests(unittest.TestCase):
         self.assertIn("送信テスト", test_msg.subject)
         self.assertIn("[ERROR] sample", test_msg.body)
 
+    def test_notify_note_skips_counts_and_can_attach(self) -> None:
+        import notify as notify_mail
+
+        sent: list[tuple[str, str]] = []
+
+        def fake_send(_settings: notify_mail.NotifySettings, subject: str, body: str) -> tuple[bool, str]:
+            sent.append((subject, body))
+            return True, ""
+
+        ok = notify_mail.notify_note(
+            "moriyama-mail-automation",
+            "[メルマガ依頼] 件名",
+            "専用フォームに依頼が届きました。",
+            attachments=[("shiryo.pdf", b"%PDF-1.4")],
+            sender=fake_send,
+            settings=notify_mail.NotifySettings(
+                enabled=True,
+                to_email="modafang111@gmail.com",
+                smtp_host="smtp.gmail.com",
+                smtp_port=587,
+                smtp_user="modafang111@gmail.com",
+                smtp_password="secret",
+            ),
+        )
+        self.assertTrue(ok)
+        self.assertEqual(sent[0][0], "[メルマガ依頼] 件名")
+        self.assertIn("専用フォームに依頼が届きました。", sent[0][1])
+        self.assertNotIn("集計", sent[0][1])
+        self.assertNotIn("同期成功", sent[0][1])
+
+        settings = notify_mail.NotifySettings(
+            enabled=True,
+            to_email="modafang111@gmail.com",
+            smtp_host="smtp.gmail.com",
+            smtp_port=587,
+            smtp_user="modafang111@gmail.com",
+            smtp_password="secret",
+        )
+        msg = notify_mail.build_email(
+            settings,
+            "[メルマガ依頼] 件名",
+            "本文",
+            attachments=[("shiryo.pdf", b"%PDF-1.4")],
+        )
+        filenames = [
+            part.get_filename()
+            for part in msg.iter_attachments()
+        ]
+        self.assertEqual(filenames, ["shiryo.pdf"])
+
     def test_notify_job_reads_home_password_and_names_project(self) -> None:
         import notify as notify_mail
 

@@ -378,6 +378,12 @@ import sys
 sys.path.insert(0, r"D:\dev\cloud-agent-sync")
 import notify as notify_mail
 
+notify_mail.notify_note(
+    "moriyama-mail-automation",
+    "[メルマガ依頼] 件名",
+    "本文",
+    attachments=[("shiryo.pdf", b"...")],
+)
 notify_mail.notify_job("line-stamp-auto", "start")
 try:
     # いつもの処理

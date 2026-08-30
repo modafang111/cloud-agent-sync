@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import os
 import smtplib
 import socket
@@ -22,6 +23,8 @@ from email.message import EmailMessage
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Sequence
+
+Attachment = tuple[str, bytes]
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_FILE_NAME = "config.json"
@@ -304,14 +307,37 @@ def build_message(
     )
 
 
-def smtp_send(settings: NotifySettings, subject: str, body: str) -> tuple[bool, str]:
-    if not settings.ready():
-        return False, "notify not configured"
+def build_email(
+    settings: NotifySettings,
+    subject: str,
+    body: str,
+    attachments: Sequence[Attachment] | None = None,
+) -> EmailMessage:
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = settings.smtp_user
     msg["To"] = settings.to_email
     msg.set_content(body)
+    for filename, data in attachments or ():
+        name = Path(str(filename or "attachment.bin")).name or "attachment.bin"
+        ctype, _encoding = mimetypes.guess_type(name)
+        if ctype:
+            maintype, subtype = ctype.split("/", 1)
+        else:
+            maintype, subtype = "application", "octet-stream"
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=name)
+    return msg
+
+
+def smtp_send(
+    settings: NotifySettings,
+    subject: str,
+    body: str,
+    attachments: Sequence[Attachment] | None = None,
+) -> tuple[bool, str]:
+    if not settings.ready():
+        return False, "notify not configured"
+    msg = build_email(settings, subject, body, attachments)
     try:
         if int(settings.smtp_port) == 465:
             with smtplib.SMTP_SSL(settings.smtp_host, settings.smtp_port, timeout=30) as smtp:
@@ -343,6 +369,7 @@ def send(
     sender: MailSender | None = None,
     log_line: Callable[[str], None] | None = None,
     project: str = "",
+    subject: str = "",
 ) -> bool:
     """開始・終了・テスト・起動失敗のすべてが使う送信入口。"""
     if not settings.enabled:
@@ -363,6 +390,8 @@ def send(
         dry_run=dry_run,
         project=project,
     )
+    if subject.strip():
+        message.subject = subject.strip()
     ok, err = (sender or smtp_send)(settings, message.subject, message.body)
     if ok:
         print(f"通知メールを送信しました: {settings.to_email}  ({message.subject})")
@@ -377,31 +406,74 @@ def send(
 
 def home_settings() -> NotifySettings:
     """パスワードは cloud-agent-sync の notify.local.json だけを読む。呼び元プロジェクトには置かない。"""
-    return load_settings(SCRIPT_DIR / CONFIG_FILE_NAME)
+    settings = load_settings(SCRIPT_DIR / CONFIG_FILE_NAME)
+    local = _read_json_object(SCRIPT_DIR / NOTIFY_LOCAL_FILE_NAME)
+    settings.smtp_password = str(local.get("smtp_password") or "").strip().replace(" ", "")
+    return settings
+
+
+def notify_note(
+    project: str,
+    subject: str,
+    body: str,
+    *,
+    attachments: Sequence[Attachment] | None = None,
+    sender: MailSender | None = None,
+    settings: NotifySettings | None = None,
+    log_line: Callable[[str], None] | None = None,
+) -> bool:
+    """集計なしの単純通知。添付可。設定は notify.local.json。"""
+    cfg = settings or home_settings()
+    if not cfg.enabled:
+        return False
+    if not cfg.ready():
+        for line in notify_setup_hint():
+            print(line)
+        if log_line:
+            log_line("NOTIFY skipped (password or address missing)")
+        return False
+    title = (subject or "").strip() or f"{SUBJECT_PREFIX} {(project or '').strip() or 'note'}"
+    if sender is not None:
+        ok, err = sender(cfg, title, body)
+    else:
+        ok, err = smtp_send(cfg, title, body, attachments)
+    if ok:
+        print(f"通知メールを送信しました: {cfg.to_email}  ({title})")
+        if log_line:
+            log_line(f"NOTIFY sent to={cfg.to_email} subject={title}")
+        return True
+    print(f"通知メールの送信に失敗しました: {err}")
+    if log_line:
+        log_line(f"NOTIFY failed {err}")
+    return False
 
 
 def notify_job(
     project: str,
     event: NotifyEvent | str = NotifyEvent.END,
     *,
+    counts: NotifyCounts | None = None,
     note: str = "",
     crash: str = "",
     details: Sequence[str] | None = None,
     log_path: Path | str | None = None,
     sender: MailSender | None = None,
     settings: NotifySettings | None = None,
+    subject: str = "",
 ) -> bool:
     """他の Python プロジェクト用。設定・パスワードは常にこの notify.py の置き場所を使う。"""
     name = (project or "").strip() or "project"
     return send(
         settings or home_settings(),
         event,
+        counts=counts,
         note=note,
         crash=crash,
         details=details,
         log_path=log_path,
         sender=sender,
         project=name,
+        subject=subject,
     )
 
 
