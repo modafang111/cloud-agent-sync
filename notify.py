@@ -142,7 +142,7 @@ def notify_setup_hint(example_dir: Path | None = None) -> list[str]:
         "[警告] 通知メールを送れません。Gmail のアプリパスワードが必要です。",
         f"  1. {example} を notify.local.json にコピー",
         "  2. Google アカウント → セキュリティ → 2段階認証 → アプリパスワード",
-        "  3. notify.local.json の smtp_password にアプリパスワードを書く",
+        "  3. notify.local.json の smtp_password、または %USERPROFILE%\\.config\\notify-mail.env に書く",
         "  4. sync --notify-test で送信テスト",
     ]
 
@@ -405,10 +405,29 @@ def send(
 
 
 def home_settings() -> NotifySettings:
-    """パスワードは cloud-agent-sync の notify.local.json だけを読む。呼び元プロジェクトには置かない。"""
+    """パスワードは notify.local.json、なければソフト横断の共通ファイルを読む。"""
     settings = load_settings(SCRIPT_DIR / CONFIG_FILE_NAME)
     local = _read_json_object(SCRIPT_DIR / NOTIFY_LOCAL_FILE_NAME)
     settings.smtp_password = str(local.get("smtp_password") or "").strip().replace(" ", "")
+    if settings.smtp_password:
+        return settings
+    try:
+        shared_root = Path(r"D:\dev")
+        if str(shared_root) not in sys.path:
+            sys.path.insert(0, str(shared_root))
+        from notify_mail_env import apply_shared_notify_env
+
+        apply_shared_notify_env()
+    except ImportError:
+        return settings
+    settings.smtp_password = os.environ.get("SMTP_PASSWORD", "").strip().replace(" ", "")
+    if not settings.smtp_user:
+        settings.smtp_user = os.environ.get("SMTP_USER", "").strip()
+    if not settings.to_email:
+        settings.to_email = os.environ.get("NOTIFY_EMAIL", "").strip()
+    host = os.environ.get("SMTP_HOST", "").strip()
+    if host:
+        settings.smtp_host = host
     return settings
 
 
