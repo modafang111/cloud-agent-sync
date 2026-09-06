@@ -1,0 +1,65 @@
+# Source only. Do not commit generated files, secrets, or large binaries.
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.tox/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+*.venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+
+# Build / dist
+dist/
+build/
+out/
+*.egg
+
+# Logs and temp
+logs/
+log/
+tmp/
+temp/
+*.log
+*.tmp
+*.temp
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+token.json
+cookies.json
+
+# Large tools / media
+ffmpeg/
+ffprobe.exe
+ffplay.exe
+ffmpeg.exe
+ngrok.exe
+ngrok
+*.mp4
+*.mov
+*.wav
+*.zip
+*.7z
+*.rar
+
+# Windows / editor
+Thumbs.db
+desktop.ini
+.DS_Store
+.cursor/

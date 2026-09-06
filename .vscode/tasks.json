@@ -1,0 +1,34 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Git Sync All",
+      "type": "shell",
+      "command": "python3",
+      "args": ["${workspaceFolder}/sync.py"],
+      "windows": {
+        "command": "${workspaceFolder}\\bin\\sync.cmd",
+        "args": []
+      },
+      "osx": {
+        "command": "python3",
+        "args": ["${workspaceFolder}/sync.py"]
+      },
+      "linux": {
+        "command": "python3",
+        "args": ["${workspaceFolder}/sync.py"]
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "focus": true,
+        "clear": true
+      },
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      }
+    }
+  ]
+}
